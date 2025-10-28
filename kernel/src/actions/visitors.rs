@@ -934,6 +934,7 @@ mod tests {
             Some(100),
             "base_row_id mismatch - check getter index"
         );
+
         assert_eq!(
             remove.default_row_commit_version,
             Some(5),
