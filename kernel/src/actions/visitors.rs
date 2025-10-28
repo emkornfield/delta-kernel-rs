@@ -900,6 +900,7 @@ mod tests {
             Some(true),
             "extended_file_metadata mismatch"
         );
+
         assert_eq!(
             remove.partition_values,
             Some(HashMap::from([("part".to_string(), "value".to_string())])),
