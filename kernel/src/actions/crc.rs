@@ -25,7 +25,7 @@ pub(crate) struct Crc {
     pub(crate) txn_id: Option<String>,
     /// Total size of the table in bytes, calculated as the sum of the `size` field of all live
     /// [`Add`] actions.
-    pub(crate) table_size_bytes: i64,
+    pub(crate) table_size_bytes: i,
     /// Number of live [`Add`] actions in this table version after action reconciliation.
     pub(crate) num_files: i64,
     /// Number of [`Metadata`] actions. Must be 1.
