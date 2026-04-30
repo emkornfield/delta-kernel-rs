@@ -19,8 +19,8 @@ use itertools::Itertools;
 use serde_json::Deserializer;
 use tempfile::tempdir;
 use test_utils::{
-    copy_directory, create_default_engine, create_default_engine_mt_executor,
-    read_actions_from_commit, setup_test_tables,
+    copy_directory, create_default_engine, create_default_engine_mt_executor, create_table,
+    engine_store_setup, read_actions_from_commit, setup_test_tables,
 };
 use url::Url;
 
@@ -1139,5 +1139,417 @@ async fn test_remove_files_partitioned_with_parsed_columns(
             );
         }
     }
+    Ok(())
+}
+
+/// Verifies that Add actions written by [`update_deletion_vectors`] preserve statistics even
+/// when scan files originate from a checkpoint that stores only struct stats
+/// (`writeStatsAsJson=false`, `writeStatsAsStruct=true`). In that case scan rows have
+/// `stats=null` and `stats_parsed=non-null`; without the fix the add-action transform drops
+/// `stats_parsed` without first coalescing it back into `stats`, losing the statistics.
+///
+/// Two cases:
+/// - `use_struct_stats_checkpoint=false`: `stats` is non-null JSON (normal path). Add action stats
+///   pass through unchanged.
+/// - `use_struct_stats_checkpoint=true`: checkpoint stores only `stats_parsed`; `stats=null` in
+///   scan rows. Without the fix the Add action would have `stats=null`.
+///
+/// The sibling test `test_remove_files_after_predicate_scan_includes_stats_parsed` covers the
+/// same coalesce path for the Remove action.
+#[rstest::rstest]
+#[case::no_struct_stats_checkpoint(false)]
+#[case::struct_stats_checkpoint(true)]
+// Multi-thread runtime required: the struct-stats case calls `Snapshot::checkpoint`, which
+// makes nested `block_on` calls that deadlock a single-threaded executor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_update_deletion_vectors_coalesces_stats_from_parsed(
+    #[case] use_struct_stats_checkpoint: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let schema = get_simple_int_schema();
+
+    // Use a local directory so `set_table_properties` can read commit files from disk and
+    // `read_actions_from_commit` can verify the output.
+    let tmp_dir = tempdir()?;
+    let tmp_url = Url::from_directory_path(tmp_dir.path()).unwrap();
+    let (store, engine, table_url) = engine_store_setup("dv_stats_coalesce", Some(&tmp_url));
+    let engine = Arc::new(engine);
+
+    // Create a DV-enabled table (protocol 3/7 with deletionVectors feature).
+    create_table(
+        store,
+        table_url.clone(),
+        schema.clone(),
+        &[],
+        true,
+        vec!["deletionVectors"],
+        vec!["deletionVectors"],
+    )
+    .await?;
+
+    // Write two parquet files ([1,2,3] and [4,5,6]) so each file has numRecords=3 in its stats.
+    write_data_and_check_result_and_stats(table_url.clone(), schema.clone(), engine.clone(), 1)
+        .await?;
+
+    // When `use_struct_stats_checkpoint=true`: set table properties to omit the JSON stats
+    // string (`writeStatsAsJson=false`) and store only the struct (`writeStatsAsStruct=true`),
+    // then checkpoint. Scan rows from that checkpoint have `stats=null` and
+    // `stats_parsed=non-null`, exercising the coalesce path in the fix.
+    let (snapshot, expected_commit_version) = if use_struct_stats_checkpoint {
+        let table_path = table_url.to_file_path().unwrap();
+        let snapshot_v2 = set_table_properties(
+            table_path.to_str().unwrap(),
+            &table_url,
+            engine.as_ref(),
+            1,
+            &[
+                ("delta.checkpoint.writeStatsAsJson", "false"),
+                ("delta.checkpoint.writeStatsAsStruct", "true"),
+            ],
+        )?;
+        let mt_engine = create_default_engine_mt_executor(&table_url)?;
+        snapshot_v2.checkpoint(mt_engine.as_ref())?;
+        (
+            Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?,
+            3u64,
+        )
+    } else {
+        (
+            Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?,
+            2u64,
+        )
+    };
+
+    // Request all stats columns so `stats_parsed` is always present in scan output, covering
+    // both the drop-only path and the coalesce path.
+    let scan_files: Vec<_> = snapshot
+        .clone()
+        .scan_builder()
+        .include_all_stats_columns()
+        .build()?
+        .scan_metadata(engine.as_ref())?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|sm| sm.scan_files)
+        .collect();
+
+    // Pick one file path to update with a new DV descriptor.
+    let target_path = paths_from_scan_files(&scan_files)
+        .into_iter()
+        .next()
+        .expect("table should have at least one file");
+
+    let mut dv_map = HashMap::new();
+    dv_map.insert(
+        target_path,
+        DeletionVectorDescriptor {
+            storage_type: DeletionVectorStorageType::PersistedRelative,
+            path_or_inline_dv: "new_dv.bin".to_string(),
+            offset: None,
+            size_in_bytes: 42,
+            cardinality: 1,
+        },
+    );
+
+    let mut txn = snapshot
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_data_change(true);
+    txn.update_deletion_vectors(dv_map, scan_files.into_iter().map(Ok))?;
+
+    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+    assert_eq!(committed.commit_version(), expected_commit_version);
+
+    // Key assertion: the Add action produced by the DV update must carry a non-null `stats`
+    // JSON string with `numRecords > 0`. Before the fix, the add-action transform lacked the
+    // `COALESCE(stats, TO_JSON(stats_parsed))` step, so `stats` would be null when the
+    // checkpoint stored only `stats_parsed` (i.e. `writeStatsAsJson=false`).
+    let add_actions = read_actions_from_commit(&table_url, expected_commit_version, "add")?;
+    assert!(
+        !add_actions.is_empty(),
+        "DV update should produce at least one add action"
+    );
+    for add in &add_actions {
+        let stats_str = add["stats"]
+            .as_str()
+            .expect("add action stats should be a non-null JSON string");
+        let stats: serde_json::Value = serde_json::from_str(stats_str)?;
+        assert!(
+            stats["numRecords"].as_i64().unwrap_or(0) > 0,
+            "stats.numRecords should be populated in DV-update add action, got: {stats}"
+        );
+    }
+
+    Ok(())
+}
+
+/// Extract selected file paths from scan metadata batches.
+///
+/// Uses Arrow downcast (test-only pattern) to read the `path` column and filters by the
+/// selection vector so only rows selected for processing are included.
+fn paths_from_scan_files(batches: &[FilteredEngineData]) -> Vec<String> {
+    use delta_kernel::arrow::array::StringArray;
+    use delta_kernel::engine::arrow_data::ArrowEngineData;
+    batches
+        .iter()
+        .flat_map(|batch| {
+            let record_batch = batch
+                .data()
+                .any_ref()
+                .downcast_ref::<ArrowEngineData>()
+                .unwrap()
+                .record_batch();
+            let path_col = record_batch.column_by_name("path").unwrap();
+            let paths = path_col.as_any().downcast_ref::<StringArray>().unwrap();
+            let sv = batch.selection_vector();
+            paths
+                .iter()
+                .enumerate()
+                .filter_map(|(i, p)| {
+                    let selected = sv.get(i).copied().unwrap_or(true);
+                    if selected {
+                        p.map(String::from)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// Regression test: update_deletion_vectors fails with "Too few fields in output schema" when
+/// scan metadata contains a stats_parsed column. This column is added by
+/// include_all_stats_columns() on the scan builder. The fix adds
+/// with_dropped_field_if_exists(STATS_PARSED_NAME) to the add-action transform in
+/// generate_adds_for_dv_update.
+///
+/// Both cases are tested so the baseline (no extra columns) and the buggy path (stats_parsed
+/// present) are covered.
+#[rstest::rstest]
+#[case::baseline_no_include_stats(false)]
+#[case::include_all_stats_cols(true)]
+#[tokio::test]
+async fn test_update_deletion_vectors_with_stats_parsed(
+    #[case] include_stats_cols: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "id",
+        DataType::INTEGER,
+    )])?);
+    let file_names = &["file0.parquet", "file1.parquet"];
+    let (_store, engine, table_url, file_paths) =
+        create_dv_table_with_files("test_table_dv_stats_parsed", schema, file_names).await?;
+
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let mut txn = snapshot
+        .clone()
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_data_change(true);
+
+    let mut scan_builder = snapshot.clone().scan_builder();
+    if include_stats_cols {
+        scan_builder = scan_builder.include_all_stats_columns();
+    }
+    let scan_files: Vec<_> = scan_builder
+        .build()?
+        .scan_metadata(engine.as_ref())?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|sm| sm.scan_files)
+        .collect();
+
+    let mut dv_map = HashMap::new();
+    dv_map.insert(
+        file_paths[0].clone(),
+        DeletionVectorDescriptor {
+            storage_type: DeletionVectorStorageType::PersistedRelative,
+            path_or_inline_dv: "new_dv.bin".to_string(),
+            offset: None,
+            size_in_bytes: 42,
+            cardinality: 1,
+        },
+    );
+    txn.update_deletion_vectors(dv_map, scan_files.into_iter().map(Ok))?;
+
+    // Before the fix, this commit would fail with "Too few fields in output schema"
+    // when include_stats_cols is true, because stats_parsed was not dropped from the
+    // add-action transform in generate_adds_for_dv_update.
+    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+    assert_eq!(committed.commit_version(), 2);
+    Ok(())
+}
+
+/// Regression test: update_deletion_vectors fails with "Too few fields in output schema" when
+/// scan metadata contains a partitionValues_parsed column. This column is added when the scan
+/// predicate touches a partition column. The fix adds
+/// with_dropped_field_if_exists(PARTITION_VALUES_PARSED_NAME) to the add-action transform in
+/// generate_adds_for_dv_update.
+///
+/// Three predicate shapes are covered:
+/// - no predicate: no partitionValues_parsed (baseline).
+/// - data-column predicate: no partitionValues_parsed (negative case; fix must not affect scans
+///   whose predicate misses the partition columns).
+/// - partition predicate: partitionValues_parsed present, exercising the fix.
+///
+/// All cases also use include_all_stats_columns() so stats_parsed is always present, which
+/// means the partition-predicate case exercises both extra-column drop paths together.
+///
+/// expected_update_partitions lists the country values that should have their DVs updated.
+/// Its length equals the number of matched files, and its contents verify the correct files
+/// were selected by the predicate.
+#[rstest::rstest]
+#[case::no_predicate(None, &["usa", "japan"])]
+#[case::data_predicate(
+    Some(Pred::gt(column_expr!("id"), Expr::literal(0_i32))),
+    &["usa", "japan"]
+)]
+#[case::partition_predicate(
+    Some(Pred::eq(column_expr!("country"), Expr::literal("usa".to_string()))),
+    &["usa"]
+)]
+#[tokio::test]
+async fn test_update_deletion_vectors_partitioned_with_parsed_columns(
+    #[case] predicate: Option<Pred>,
+    #[case] expected_update_partitions: &[&str],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let partition_col = "country";
+    let table_schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("country", DataType::STRING),
+    ])?);
+    let data_schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "id",
+        DataType::INTEGER,
+    )])?);
+
+    let tmp_dir = tempdir()?;
+    let tmp_url = Url::from_directory_path(tmp_dir.path()).unwrap();
+
+    let (store, engine, table_url) = engine_store_setup("test_dv_partitioned", Some(&tmp_url));
+    let engine = Arc::new(engine);
+    create_table(
+        store.clone(),
+        table_url.clone(),
+        table_schema.clone(),
+        &[partition_col],
+        true,
+        vec!["deletionVectors"],
+        vec!["deletionVectors"],
+    )
+    .await?;
+
+    // Write two partitions: country="usa" and country="japan".
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let mut txn = snapshot
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_data_change(true);
+    for (data, partition_val) in [([1_i32, 2, 3], "usa"), ([10, 20, 30], "japan")] {
+        let batch = RecordBatch::try_new(
+            Arc::new(data_schema.as_ref().try_into_arrow()?),
+            vec![Arc::new(Int32Array::from(data.to_vec()))],
+        )?;
+        let ctx = Arc::new(txn.partitioned_write_context(HashMap::from([(
+            partition_col.to_string(),
+            Scalar::String(partition_val.into()),
+        )]))?);
+        let add_meta = engine
+            .write_parquet(Box::new(ArrowEngineData::new(batch)).as_ref(), ctx.as_ref())
+            .await?;
+        txn.add_files(add_meta);
+    }
+    txn.commit(engine.as_ref())?.unwrap_committed();
+
+    // Scan with include_all_stats_columns() to force stats_parsed into the scan output.
+    // Optionally add a predicate so partitionValues_parsed also appears (partition-predicate case).
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let mut scan_builder = snapshot.clone().scan_builder().include_all_stats_columns();
+    if let Some(pred) = predicate.clone() {
+        scan_builder = scan_builder.with_predicate(Arc::new(pred));
+    }
+    let scan_files: Vec<_> = scan_builder
+        .build()?
+        .scan_metadata(engine.as_ref())?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|sm| sm.scan_files)
+        .collect();
+
+    // Extract the file paths that are selected by the predicate scan. The dv_map must
+    // contain exactly these paths, because update_deletion_vectors validates that all
+    // dv_map entries are found in the scan data.
+    let matched_paths = paths_from_scan_files(&scan_files);
+    assert_eq!(
+        matched_paths.len(),
+        expected_update_partitions.len(),
+        "number of selected scan files should match expected_update_partitions"
+    );
+
+    let mut dv_map = HashMap::new();
+    for (idx, path) in matched_paths.iter().enumerate() {
+        dv_map.insert(
+            path.clone(),
+            DeletionVectorDescriptor {
+                storage_type: DeletionVectorStorageType::PersistedRelative,
+                path_or_inline_dv: format!("dv_update_{idx}.bin"),
+                offset: None,
+                size_in_bytes: 42,
+                cardinality: 1,
+            },
+        );
+    }
+
+    let mut txn = snapshot
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_data_change(true);
+    txn.update_deletion_vectors(dv_map, scan_files.into_iter().map(Ok))?;
+
+    // Before the fix, this commit would fail with "Too few fields in output schema"
+    // when stats_parsed and/or partitionValues_parsed are present in the scan data.
+    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+    assert_eq!(committed.commit_version(), 2);
+
+    // Verify the correct number of remove/add pairs were written.
+    let remove_actions = read_actions_from_commit(&table_url, 2, "remove")?;
+    let add_actions = read_actions_from_commit(&table_url, 2, "add")?;
+    assert_eq!(
+        remove_actions.len(),
+        expected_update_partitions.len(),
+        "expected {} remove actions, got {}: {remove_actions:?}",
+        expected_update_partitions.len(),
+        remove_actions.len()
+    );
+    assert_eq!(
+        add_actions.len(),
+        expected_update_partitions.len(),
+        "expected {} add actions, got {}: {add_actions:?}",
+        expected_update_partitions.len(),
+        add_actions.len()
+    );
+
+    // Add actions should have the new DV set.
+    for add in &add_actions {
+        let dv = add["deletionVector"]
+            .as_object()
+            .expect("add action should have deletionVector after update");
+        assert_eq!(
+            dv.get("storageType").and_then(|v| v.as_str()),
+            Some("u"),
+            "DV storageType should be 'u' (PersistedRelative)"
+        );
+    }
+
+    // Remove actions reflect the pre-update state: newly-written files have no existing DV.
+    for remove in &remove_actions {
+        assert!(
+            remove["deletionVector"].is_null(),
+            "remove action for newly-written file should not have an existing DV"
+        );
+    }
+
     Ok(())
 }

@@ -24,9 +24,12 @@ use crate::engine_data::{
     FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, TypedGetData,
 };
 use crate::error::Error;
+use crate::expressions::UnaryExpressionOp::ToJson;
 use crate::expressions::{column_name, ArrayData, ColumnName, Scalar, StructData, Transform};
 use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
-use crate::scan::log_replay::get_scan_metadata_transform_expr;
+use crate::scan::log_replay::{
+    get_scan_metadata_transform_expr, PARTITION_VALUES_PARSED_NAME, STATS_PARSED_NAME,
+};
 use crate::scan::{restored_add_schema, scan_row_schema};
 use crate::schema::{ArrayType, SchemaRef, StructField, StructType, ToSchema};
 use crate::snapshot::SnapshotRef;
@@ -466,31 +469,61 @@ impl<S> Transaction<S> {
     /// Generates Add actions for files with updated deletion vectors.
     ///
     /// This transforms scan file metadata with new DV descriptors (appended as a temporary column)
-    /// into Add actions for the Delta log.
+    /// into Add actions for the Delta log. Handles extra columns that predicate-based scans may
+    /// add to scan metadata (`stats_parsed`, `partitionValues_parsed`) by dropping them before
+    /// passing the data to the subsequent restore-add transform.
+    ///
+    /// When `stats_parsed` is present (added by data-skipping scans or checkpoint reads), two
+    /// evaluators are built. The `stats_parsed` evaluator applies
+    /// `COALESCE(stats, TO_JSON(stats_parsed))` before dropping `stats_parsed`, preserving
+    /// statistics that come from checkpoints written with `writeStatsAsJson=false`. This mirrors
+    /// the same coalesce logic on the remove-action path in `generate_remove_actions`.
     fn generate_adds_for_dv_update<'a>(
         &'a self,
         engine: &'a dyn Engine,
         file_metadata_batch: impl Iterator<Item = &'a FilteredEngineData> + Send + 'a,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<FilteredEngineData>> + Send + 'a> {
         let evaluation_handler = engine.evaluation_handler();
-        // Transform to replace the deletionVector field with the new DV from
-        // NEW_DELETION_VECTOR_NAME, then drop the NEW_DELETION_VECTOR_NAME column. The
-        // engine data has this temporary column appended by update_deletion_vectors(), but
-        // it is not expected by the transforms used in generate_remove_actions() which
-        // expect only the scan row schema fields.
-        let with_new_dv_transform = Expression::transform(
-            Transform::new_top_level()
+
+        // Build the first-step transform: replace deletionVector with the new DV, drop the
+        // temporary NEW_DELETION_VECTOR_NAME column, and handle stats_parsed /
+        // partitionValues_parsed. Two variants are needed:
+        //
+        // - base: drop stats_parsed if present (no coalesce); used when stats is non-null.
+        // - stats_parsed: coalesce stats = COALESCE(stats, TO_JSON(stats_parsed)) then drop it;
+        //   used when the scan source is a checkpoint with writeStatsAsJson=false, which stores
+        //   stats_parsed but leaves stats null.
+        let make_with_new_dv_eval = |coalesce_stats: bool| -> DeltaResult<_> {
+            let mut transform = Transform::new_top_level()
                 .with_replaced_field(
                     "deletionVector",
                     Expression::column([NEW_DELETION_VECTOR_NAME]).into(),
                 )
-                .with_dropped_field(NEW_DELETION_VECTOR_NAME),
-        );
-        let with_new_dv_eval = evaluation_handler.new_expression_evaluator(
-            intermediate_dv_schema().clone(),
-            Arc::new(with_new_dv_transform),
-            nullable_scan_rows_schema().clone().into(),
-        )?;
+                .with_dropped_field(NEW_DELETION_VECTOR_NAME);
+            if coalesce_stats {
+                transform = transform.with_replaced_field(
+                    "stats",
+                    Expression::coalesce([
+                        Expression::column(["stats"]),
+                        Expression::unary(ToJson, Expression::column([STATS_PARSED_NAME])),
+                    ])
+                    .into(),
+                );
+            }
+            let transform = transform
+                .with_dropped_field_if_exists(STATS_PARSED_NAME)
+                .with_dropped_field_if_exists(PARTITION_VALUES_PARSED_NAME);
+            evaluation_handler.new_expression_evaluator(
+                intermediate_dv_schema().clone(),
+                Arc::new(Expression::transform(transform)),
+                nullable_scan_rows_schema().clone().into(),
+            )
+        };
+
+        let base_eval = Arc::new(make_with_new_dv_eval(false)?);
+        let stats_parsed_eval = Arc::new(make_with_new_dv_eval(true)?);
+        let stats_parsed_col = ColumnName::new([STATS_PARSED_NAME]);
+
         let restored_add_eval = evaluation_handler.new_expression_evaluator(
             nullable_scan_rows_schema().clone(),
             get_scan_metadata_transform_expr(),
@@ -510,7 +543,13 @@ impl<S> Transaction<S> {
         )?;
         Ok(file_metadata_batch.map(
             move |file_metadata_batch| -> DeltaResult<FilteredEngineData> {
-                let with_new_dv_data = with_new_dv_eval.evaluate(file_metadata_batch.data())?;
+                let data = file_metadata_batch.data();
+                let with_new_dv_eval = if data.has_field(&stats_parsed_col) {
+                    &stats_parsed_eval
+                } else {
+                    &base_eval
+                };
+                let with_new_dv_data = with_new_dv_eval.evaluate(data)?;
 
                 let as_partial_add_data = restored_add_eval.evaluate(with_new_dv_data.as_ref())?;
 
