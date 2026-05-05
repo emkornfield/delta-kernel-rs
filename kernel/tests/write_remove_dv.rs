@@ -19,16 +19,16 @@ use itertools::Itertools;
 use serde_json::Deserializer;
 use tempfile::tempdir;
 use test_utils::{
-    copy_directory, create_default_engine, create_default_engine_mt_executor, create_table,
-    engine_store_setup, read_actions_from_commit, setup_test_tables,
+    copy_directory, create_default_engine, create_table, engine_store_setup,
+    read_actions_from_commit, setup_test_tables,
 };
 use url::Url;
 
 mod common;
 
 use common::write_utils::{
-    create_dv_table_with_files, get_scan_files, get_simple_int_schema, set_table_properties,
-    write_data_and_check_result_and_stats,
+    create_dv_table_with_files, get_scan_files, get_simple_int_schema,
+    snapshot_with_optional_struct_stats_checkpoint, write_data_and_check_result_and_stats,
 };
 
 #[tokio::test]
@@ -922,31 +922,12 @@ async fn test_remove_files_after_predicate_scan_includes_stats_parsed(
         write_data_and_check_result_and_stats(table_url.clone(), schema.clone(), engine.clone(), 1)
             .await?;
 
-        // When use_struct_stats_checkpoint=true, update table properties so the checkpoint
-        // omits the stats JSON string (writeStatsAsJson=false) but stores stats as a struct
-        // (writeStatsAsStruct=true). After checkpointing, scan rows from the checkpoint have
-        // stats=null and stats_parsed=non-null, exercising the coalesce path in the fix.
-        let snapshot = if use_struct_stats_checkpoint {
-            let table_path = table_url.to_file_path().unwrap();
-            let snapshot_v2 = set_table_properties(
-                table_path.to_str().unwrap(),
-                &table_url,
-                engine.as_ref(),
-                1,
-                &[
-                    ("delta.checkpoint.writeStatsAsJson", "false"),
-                    ("delta.checkpoint.writeStatsAsStruct", "true"),
-                ],
-            )?;
-            // `Snapshot::checkpoint` makes nested `block_on` calls internally (it reads the
-            // log segment lazily while writing). This requires `TokioMultiThreadExecutor`,
-            // which uses `block_in_place` to avoid deadlocking a single-thread runtime.
-            let mt_engine = create_default_engine_mt_executor(&table_url)?;
-            snapshot_v2.checkpoint(mt_engine.as_ref())?;
-            Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?
-        } else {
-            Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?
-        };
+        let snapshot = snapshot_with_optional_struct_stats_checkpoint(
+            use_struct_stats_checkpoint,
+            &table_url,
+            engine.as_ref(),
+            1,
+        )?;
 
         // commit_version = 2 (no checkpoint) or 3 (properties commit + checkpoint bump)
         let expected_commit_version = if use_struct_stats_checkpoint { 3 } else { 2 };
@@ -1192,34 +1173,18 @@ async fn test_update_deletion_vectors_coalesces_stats_from_parsed(
     write_data_and_check_result_and_stats(table_url.clone(), schema.clone(), engine.clone(), 1)
         .await?;
 
-    // When `use_struct_stats_checkpoint=true`: set table properties to omit the JSON stats
-    // string (`writeStatsAsJson=false`) and store only the struct (`writeStatsAsStruct=true`),
-    // then checkpoint. Scan rows from that checkpoint have `stats=null` and
-    // `stats_parsed=non-null`, exercising the coalesce path in the fix.
-    let (snapshot, expected_commit_version) = if use_struct_stats_checkpoint {
-        let table_path = table_url.to_file_path().unwrap();
-        let snapshot_v2 = set_table_properties(
-            table_path.to_str().unwrap(),
-            &table_url,
-            engine.as_ref(),
-            1,
-            &[
-                ("delta.checkpoint.writeStatsAsJson", "false"),
-                ("delta.checkpoint.writeStatsAsStruct", "true"),
-            ],
-        )?;
-        let mt_engine = create_default_engine_mt_executor(&table_url)?;
-        snapshot_v2.checkpoint(mt_engine.as_ref())?;
-        (
-            Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?,
-            3u64,
-        )
+    // commit_version = 2 (no checkpoint) or 3 (properties commit + checkpoint bump)
+    let expected_commit_version = if use_struct_stats_checkpoint {
+        3u64
     } else {
-        (
-            Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?,
-            2u64,
-        )
+        2u64
     };
+    let snapshot = snapshot_with_optional_struct_stats_checkpoint(
+        use_struct_stats_checkpoint,
+        &table_url,
+        engine.as_ref(),
+        1,
+    )?;
 
     // Request all stats columns so `stats_parsed` is always present in scan output, covering
     // both the drop-only path and the coalesce path.
@@ -1316,70 +1281,6 @@ fn paths_from_scan_files(batches: &[FilteredEngineData]) -> Vec<String> {
                 .collect::<Vec<_>>()
         })
         .collect()
-}
-
-/// Regression test: update_deletion_vectors fails with "Too few fields in output schema" when
-/// scan metadata contains a stats_parsed column. This column is added by
-/// include_all_stats_columns() on the scan builder. The fix adds
-/// with_dropped_field_if_exists(STATS_PARSED_NAME) to the add-action transform in
-/// generate_adds_for_dv_update.
-///
-/// Both cases are tested so the baseline (no extra columns) and the buggy path (stats_parsed
-/// present) are covered.
-#[rstest::rstest]
-#[case::baseline_no_include_stats(false)]
-#[case::include_all_stats_cols(true)]
-#[tokio::test]
-async fn test_update_deletion_vectors_with_stats_parsed(
-    #[case] include_stats_cols: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let _ = tracing_subscriber::fmt::try_init();
-
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "id",
-        DataType::INTEGER,
-    )])?);
-    let file_names = &["file0.parquet", "file1.parquet"];
-    let (_store, engine, table_url, file_paths) =
-        create_dv_table_with_files("test_table_dv_stats_parsed", schema, file_names).await?;
-
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let mut txn = snapshot
-        .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-        .with_data_change(true);
-
-    let mut scan_builder = snapshot.clone().scan_builder();
-    if include_stats_cols {
-        scan_builder = scan_builder.include_all_stats_columns();
-    }
-    let scan_files: Vec<_> = scan_builder
-        .build()?
-        .scan_metadata(engine.as_ref())?
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .map(|sm| sm.scan_files)
-        .collect();
-
-    let mut dv_map = HashMap::new();
-    dv_map.insert(
-        file_paths[0].clone(),
-        DeletionVectorDescriptor {
-            storage_type: DeletionVectorStorageType::PersistedRelative,
-            path_or_inline_dv: "new_dv.bin".to_string(),
-            offset: None,
-            size_in_bytes: 42,
-            cardinality: 1,
-        },
-    );
-    txn.update_deletion_vectors(dv_map, scan_files.into_iter().map(Ok))?;
-
-    // Before the fix, this commit would fail with "Too few fields in output schema"
-    // when include_stats_cols is true, because stats_parsed was not dropped from the
-    // add-action transform in generate_adds_for_dv_update.
-    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
-    assert_eq!(committed.commit_version(), 2);
-    Ok(())
 }
 
 /// Regression test: update_deletion_vectors fails with "Too few fields in output schema" when

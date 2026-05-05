@@ -25,7 +25,9 @@ use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Engine, Snapshot, Version};
 use serde_json::json;
-use test_utils::{create_add_files_metadata, create_table, engine_store_setup};
+use test_utils::{
+    create_add_files_metadata, create_default_engine_mt_executor, create_table, engine_store_setup,
+};
 use url::Url;
 use uuid::Uuid;
 
@@ -365,4 +367,38 @@ pub fn get_scan_files(
         .into_iter()
         .map(|sm| sm.scan_files)
         .collect())
+}
+
+/// Build a fresh snapshot, optionally after writing a struct-stats checkpoint.
+///
+/// When `use_struct_stats_checkpoint` is `true`:
+/// - Writes a properties commit at `current_version + 1` setting `writeStatsAsJson=false` and
+///   `writeStatsAsStruct=true`, so future checkpoints store `stats_parsed` instead of `stats`.
+/// - Creates a checkpoint. Uses a multi-thread executor internally because `Snapshot::checkpoint`
+///   makes nested `block_on` calls that would deadlock a single-threaded Tokio runtime.
+/// - Returns a fresh snapshot that reads from that checkpoint.
+///
+/// When `false`, returns a fresh snapshot at the current latest version without writing anything.
+pub fn snapshot_with_optional_struct_stats_checkpoint(
+    use_struct_stats_checkpoint: bool,
+    table_url: &Url,
+    engine: &dyn Engine,
+    current_version: Version,
+) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
+    if use_struct_stats_checkpoint {
+        let table_path = table_url.to_file_path().unwrap();
+        let snapshot_with_props = set_table_properties(
+            table_path.to_str().unwrap(),
+            table_url,
+            engine,
+            current_version,
+            &[
+                ("delta.checkpoint.writeStatsAsJson", "false"),
+                ("delta.checkpoint.writeStatsAsStruct", "true"),
+            ],
+        )?;
+        let mt_engine = create_default_engine_mt_executor(table_url)?;
+        snapshot_with_props.checkpoint(mt_engine.as_ref())?;
+    }
+    Ok(Snapshot::builder_for(table_url.clone()).build(engine)?)
 }
