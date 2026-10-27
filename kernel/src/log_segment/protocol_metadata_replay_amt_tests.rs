@@ -809,11 +809,9 @@ async fn plan_replay_bounded_by_crc_or_checkpoint_runs_one_plan(
         .unwrap();
     assert!(resolution.protocol.is_some() && resolution.metadata.is_some());
     assert!(resolution.captured_checkpoint_action.is_none());
-    let expected = if newest_has_commit_info {
-        resolved_pointer(0, 0)
-    } else {
-        LastManifestCommitResolution::Unresolved
-    };
+    let expected = LastManifestCommitResolution::Resolved(
+        newest_has_commit_info.then(|| LastManifestCommit::new(0, 0).unwrap()),
+    );
     assert_eq!(resolution.last_manifest_commit, expected);
     assert_eq!(plans.lock().unwrap().len(), 1);
 }
@@ -1348,7 +1346,8 @@ async fn post_commit_snapshot_resolves_latest_checkpoint_action(
 
 // Replay takes `lastManifestCommit` from the newest commit only: a manifest commit records itself,
 // a later log commit carries it forward, and a newest commit without one is not back-filled from an
-// older commit, so that miss stays `Unresolved`. The same holds when a CRC at v0 seeds the replay.
+// older commit. Replay always reads the newest commit, so it resolves that miss as
+// `Resolved(None)`. The same holds when a CRC at v0 seeds the replay.
 #[rstest]
 #[case::manifest_commit_records_itself(vec![], false, Some((0, 0)))]
 #[case::log_commit_carries_it_forward(vec![commit_info(Some((0, 0)))], false, Some((0, 0)))]
@@ -1361,10 +1360,9 @@ async fn replay_resolves_last_manifest_commit_from_newest_commit(
     #[case] crc_seeded: bool,
     #[case] expected: Option<(i64, i64)>,
 ) {
-    let expected = match expected {
-        Some((v, c)) => resolved_pointer(v, c),
-        None => LastManifestCommitResolution::Unresolved,
-    };
+    let expected = LastManifestCommitResolution::Resolved(
+        expected.map(|(v, c)| LastManifestCommit::new(v, c).unwrap()),
+    );
     let crc = crc_seeded.then(|| Arc::new(Crc::default()));
     let crc = crc.as_ref();
     assert_replay_last_manifest_commit(&later_commits, crc, &expected, non_plan_engine).await;
@@ -1425,12 +1423,12 @@ async fn check_pointer_after_newest_commit<E: Engine>(
 #[case::no_pointer(
     vec![pointerless_pm_commit(), commit_info(None), commit_info(None)],
     one_column_schema(),
-    LastManifestCommitResolution::Unresolved,
+    LastManifestCommitResolution::Resolved(None),
 )]
 #[case::newest_commit_has_no_commit_info(
     vec![pointerless_pm_commit(), commit_info(None), txn_commit()],
     one_column_schema(),
-    LastManifestCommitResolution::Unresolved,
+    LastManifestCommitResolution::Resolved(None),
 )]
 #[case::follows_pointer(
     vec![checkpoint_commit(1, &[], test_schema_flat_with_column_mapping()), commit_info(Some((1, 1)))],
@@ -1583,9 +1581,10 @@ async fn check_stops_at_compacted_pointed_action<E: Engine>(
 }
 
 // A replayed snapshot serves `lastManifestCommit` from build-time state: it still resolves after
-// the newest commit file is deleted.
+// the newest commit file is deleted, including a missing pointer.
 #[rstest]
 #[case::carried_pointer(commit_info(Some((0, 0))), Some((0, 0)))]
+#[case::no_pointer(pointerless_pm_commit(), None)]
 #[tokio::test]
 async fn replayed_snapshot_serves_last_manifest_commit_without_reading_the_log(
     #[case] newest_commit: String,
