@@ -565,38 +565,27 @@ async fn plan_replay_bounded_by_crc_or_checkpoint_runs_one_plan(
     #[values(false, true)] newest_has_commit_info: bool,
 ) {
     let pointer = commit_info(Some((0, 0)));
-    let txn = serde_json::json!({ "txn": { "appId": "app", "version": 1 } }).to_string();
     let newest = if newest_has_commit_info {
         pointer.clone()
     } else {
-        txn.clone()
+        txn_commit()
     };
-    let (store, table_root) = manifest_commit_table(&[pointer.clone(), pointer, newest]).await;
+    let later_commits = [pointer.clone(), pointer, newest];
+    let (store, table_root) = manifest_commit_table(&later_commits).await;
     match bound {
         ReplayBound::Crc => {
             put_crc_with_pointer(&store, 1, LastManifestCommit::new(0, 0).unwrap()).await
         }
         ReplayBound::Checkpoint => put_pm_checkpoint(&store, 1).await,
     }
-    let compaction = compacted_log_path_for_versions(2, 3, "json");
-    if compacted {
-        store.put(&compaction, txn.into()).await.unwrap();
-    }
 
     let plans = Arc::new(Mutex::new(Vec::new()));
-    let engine = recording_plan_engine(store, plans.clone());
-    let storage = engine.storage_handler();
-    let log_root = table_root.join("_delta_log/").unwrap();
-    let mut log_segment =
-        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None).unwrap();
-    if compacted {
-        let location = table_root.join(compaction.as_ref()).unwrap();
-        let compaction = ParsedLogPath::new(FileMeta::new(location, 0, 100)).unwrap();
-        log_segment
-            .listed
-            .ascending_compaction_files
-            .push(compaction);
-    }
+    let engine = recording_plan_engine(store.clone(), plans.clone());
+    let log_segment = if compacted {
+        segment_with_newest_two_compacted(&store, &table_root, &engine, later_commits.len()).await
+    } else {
+        latest_log_segment(&table_root, &engine)
+    };
     let crc = log_segment.read_latest_crc(&engine).unwrap();
 
     let resolution = log_segment
@@ -605,7 +594,7 @@ async fn plan_replay_bounded_by_crc_or_checkpoint_runs_one_plan(
     assert!(resolution.protocol.is_some() && resolution.metadata.is_some());
     assert!(resolution.captured_checkpoint_action.is_none());
     let expected = if newest_has_commit_info {
-        LastManifestCommitResolution::Resolved(Some(LastManifestCommit::new(0, 0).unwrap()))
+        resolved_pointer(0, 0)
     } else {
         LastManifestCommitResolution::Unresolved
     };
@@ -699,10 +688,7 @@ async fn plan_replay_reads_all_older_commits_when_pointed_commit_is_unlisted() {
     .await;
     let plans = Arc::new(Mutex::new(Vec::new()));
     let engine = recording_plan_engine(store, plans.clone());
-    let storage = engine.storage_handler();
-    let log_root = table_root.join("_delta_log/").unwrap();
-    let mut log_segment =
-        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None).unwrap();
+    let mut log_segment = latest_log_segment(&table_root, &engine);
     log_segment.listed.ascending_commit_files.remove(0);
 
     let resolution = log_segment
@@ -743,7 +729,7 @@ async fn replay_resolves_pointed_action_above_segment_checkpoint() {
     check_pointed_action_above_segment_checkpoint(
         |store| SyncEngine::new_with_store(store),
         None,
-        LastManifestCommitResolution::Resolved(Some(LastManifestCommit::new(2, 1).unwrap())),
+        resolved_pointer(2, 1),
     )
     .await;
 }
@@ -835,7 +821,7 @@ async fn standalone_checkpoint_above_pointed_commit_fails_to_read_its_action() {
     #[cfg(feature = "declarative-plans")]
     check_standalone_checkpoint_above_pointed_commit(
         |store| SyncEngine::new_with_store(store),
-        LastManifestCommitResolution::Resolved(Some(LastManifestCommit::new(0, 0).unwrap())),
+        resolved_pointer(0, 0),
     )
     .await;
 }
@@ -1162,9 +1148,7 @@ async fn replay_resolves_last_manifest_commit_from_newest_commit(
     #[case] expected: Option<(i64, i64)>,
 ) {
     let expected = match expected {
-        Some((v, c)) => {
-            LastManifestCommitResolution::Resolved(Some(LastManifestCommit::new(v, c).unwrap()))
-        }
+        Some((v, c)) => resolved_pointer(v, c),
         None => LastManifestCommitResolution::Unresolved,
     };
     assert_replay_last_manifest_commit(
@@ -1293,6 +1277,8 @@ async fn segment_with_newest_two_compacted(
 ) -> LogSegment {
     let newest_version = newest_version as u64;
     let compaction = compacted_log_path_for_versions(newest_version - 1, newest_version, "json");
+    // The compaction holds only a txn, so whatever P&M, checkpoint action, and pointer replay
+    // resolves must come from reading the commits it covers.
     store.put(&compaction, txn_commit().into()).await.unwrap();
 
     let mut log_segment = latest_log_segment(table_root, engine);
