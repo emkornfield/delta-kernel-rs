@@ -68,10 +68,20 @@ fn checkpoint_commit(version: i64, extra_features: &[TableFeature], schema: Sche
 // Builds a `checkpoint` action line carrying protocol and metadata at `version`, with no
 // `lastManifestCommit` pointer.
 fn checkpoint_action(version: i64, extra_features: &[TableFeature], schema: SchemaRef) -> String {
+    checkpoint_action_at_path(version, "metadata/root.parquet", extra_features, schema)
+}
+
+// Builds a `checkpoint` action line as [`checkpoint_action`] does, with its content root at `path`.
+fn checkpoint_action_at_path(
+    version: i64,
+    path: &str,
+    extra_features: &[TableFeature],
+    schema: SchemaRef,
+) -> String {
     let config = adaptive_metadata_table_configuration(schema, extra_features);
     let checkpoint = CheckpointAction {
         version,
-        content_root: ContentRoot::new("metadata/root.parquet".to_string(), 1, version),
+        content_root: ContentRoot::new(path.to_string(), 1, version),
         protocol: config.protocol().clone(),
         metadata: config.metadata().clone(),
         transactions: vec![],
@@ -296,8 +306,11 @@ async fn assert_lagging_checkpoint_loses_to_gap_commit<E: Engine>(
             (0, 0),
             metadata_commit(test_schema_flat_with_column_mapping()),
         ),
-        // A manifest commit at v2 whose checkpoint action lags at v0.
-        carrying_pointer((2, 0), checkpoint_action(0, &[], one_column_schema())),
+        // A manifest commit at v2 whose checkpoint action lags at v0, with its own content root.
+        carrying_pointer(
+            (2, 0),
+            checkpoint_action_at_path(0, "metadata/v2.parquet", &[], one_column_schema()),
+        ),
     ])
     .await;
 
@@ -308,6 +321,9 @@ async fn assert_lagging_checkpoint_loses_to_gap_commit<E: Engine>(
     let schema = snapshot.schema();
     assert!(schema.field("name").is_some());
     assert_eq!(schema.num_fields(), 2);
+    // Both actions are at checkpoint version 0; replay keeps the newest commit's.
+    let action = snapshot.latest_checkpoint_action(&engine).unwrap().unwrap();
+    assert_eq!(action.path(), "metadata/v2.parquet");
 }
 
 // A fresh (no-CRC) load runs a full replay that captures the checkpoint action onto the snapshot.
@@ -1203,8 +1219,7 @@ async fn plan_replay_rejects_pointer_after_newest_commit(
 }
 
 // The plan path reads the newest commit and the pointed manifest commit as their own files, not
-// through a log compaction covering them. Compaction listing is disabled, so the compaction is
-// added by hand.
+// through a log compaction covering them.
 #[cfg(feature = "declarative-plans")]
 #[rstest]
 #[case::covers_newest_and_manifest_commit(

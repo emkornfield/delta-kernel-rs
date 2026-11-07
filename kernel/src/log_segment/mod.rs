@@ -1069,7 +1069,10 @@ impl LogSegment {
             engine
                 .json_handler()
                 .read_json_files(files, LOG_CHECKPOINT_SCHEMA.clone(), None)?;
-        require_pointed_checkpoint_action(pointer, first_checkpoint_action(batches)?)
+        let action = first_checkpoint_action(batches)?
+            .ok_or_else(|| missing_pointed_checkpoint_action(pointer))?;
+        require_pointed_checkpoint_action(pointer, &action)?;
+        Ok(action)
     }
 
     /// The listed commit at `pointer`'s version, or `None` when this segment does not list it.
@@ -1855,14 +1858,13 @@ fn first_checkpoint_action(
     Ok(None)
 }
 
-/// Returns `action`, read from the manifest commit `pointer` names, after checking that it exists
-/// and has the pointer's content root version.
+/// Errors unless `action`, read from the manifest commit `pointer` names, has the pointer's content
+/// root version.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 fn require_pointed_checkpoint_action(
     pointer: &LastManifestCommit,
-    action: Option<CheckpointAction>,
-) -> KernelResult<CheckpointAction> {
-    let action = action.ok_or_else(|| missing_pointed_checkpoint_action(pointer))?;
+    action: &CheckpointAction,
+) -> KernelResult<()> {
     require!(
         action.content_root_version() == pointer.content_root_version,
         last_manifest_commit_inconsistency(
@@ -1873,10 +1875,10 @@ fn require_pointed_checkpoint_action(
             )
         )
     );
-    Ok(action)
+    Ok(())
 }
 
-/// The error for a manifest commit `pointer` names that carries no checkpoint action.
+/// The error for when the manifest commit that `pointer` names carries no checkpoint action.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 fn missing_pointed_checkpoint_action(pointer: &LastManifestCommit) -> KernelError {
     last_manifest_commit_inconsistency(pointer, "that commit carries no checkpoint action")
