@@ -1581,34 +1581,35 @@ async fn check_stops_at_compacted_pointed_action<E: Engine>(
 }
 
 // A replayed snapshot serves `lastManifestCommit` from build-time state: it still resolves after
-// the newest commit file is deleted, including a missing pointer.
+// the newest commit file is deleted, including a missing pointer. The newest commit has no P&M, so
+// replay reads all of it.
 #[rstest]
-#[case::carried_pointer(commit_info(Some((0, 0))), Some((0, 0)))]
-#[case::no_pointer(pointerless_pm_commit(), None)]
+#[case::carried_pointer(vec![commit_info(Some((0, 0)))], Some((0, 0)))]
+#[case::no_pointer(vec![pointerless_pm_commit(), commit_info(None)], None)]
 #[tokio::test]
 async fn replayed_snapshot_serves_last_manifest_commit_without_reading_the_log(
-    #[case] newest_commit: String,
+    #[case] later_commits: Vec<String>,
     #[case] expected: Option<(i64, i64)>,
 ) {
-    assert_snapshot_serves_last_manifest_commit(&newest_commit, expected, non_plan_engine).await;
+    assert_snapshot_serves_last_manifest_commit(&later_commits, expected, non_plan_engine).await;
     #[cfg(feature = "declarative-plans")]
-    assert_snapshot_serves_last_manifest_commit(&newest_commit, expected, |store| {
+    assert_snapshot_serves_last_manifest_commit(&later_commits, expected, |store| {
         SyncEngine::new_with_store(store)
     })
     .await;
 }
 
 async fn assert_snapshot_serves_last_manifest_commit<E: Engine>(
-    newest_commit: &str,
+    later_commits: &[String],
     expected: Option<(i64, i64)>,
     make_engine: impl FnOnce(Arc<InMemory>) -> E,
 ) {
-    let (store, table_root) = manifest_commit_table(&[newest_commit.to_string()]).await;
+    let (store, table_root) = manifest_commit_table(later_commits).await;
     let engine = make_engine(store.clone());
     let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
 
     store
-        .delete(&delta_path_for_version(1, "json"))
+        .delete(&delta_path_for_version(later_commits.len() as u64, "json"))
         .await
         .unwrap();
     let expected = expected.map(|(v, c)| LastManifestCommit::new(v, c).unwrap());
