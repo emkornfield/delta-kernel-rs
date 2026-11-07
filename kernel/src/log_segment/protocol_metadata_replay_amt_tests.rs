@@ -638,10 +638,7 @@ async fn replay_errors_on_invalid_pointer(
     "commit 1 carries a checkpoint action"
 )]
 #[case::pointer_names_newest_commit_without_action(
-    vec![
-        checkpoint_commit(0, &[], one_column_schema()),
-        carrying_pointer((1, 1), protocol_and_metadata_lines(one_column_schema(), &[])),
-    ],
+    vec![checkpoint_commit(0, &[], one_column_schema()), commit_info(Some((1, 1)))],
     "that commit carries no checkpoint action"
 )]
 #[tokio::test]
@@ -652,6 +649,34 @@ async fn replay_errors_on_newest_commit_contradicting_its_pointer(
 ) {
     let crc = crc_seeded.then(|| Arc::new(Crc::default()));
     assert_replay_errors_on_both_paths(&commits, crc.as_ref(), expected_error).await;
+}
+
+// When the newest commit has both P&M, replay can stop before its checkpoint action, so a pointer
+// naming that commit without one surfaces when the snapshot follows the pointer, not at build.
+#[tokio::test]
+async fn replay_defers_missing_pointed_action_when_newest_commit_has_pm() {
+    check_deferred_missing_pointed_action(non_plan_engine).await;
+    #[cfg(feature = "declarative-plans")]
+    check_deferred_missing_pointed_action(|store| SyncEngine::new_with_store(store)).await;
+}
+
+async fn check_deferred_missing_pointed_action<E: Engine>(
+    make_engine: impl FnOnce(Arc<InMemory>) -> E,
+) {
+    let (store, table_root) = commit_table(&[
+        checkpoint_commit(0, &[], one_column_schema()),
+        carrying_pointer(
+            (1, 1),
+            protocol_and_metadata_lines(one_column_schema(), &[]),
+        ),
+    ])
+    .await;
+    let engine = make_engine(store);
+    let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+    assert_result_error_with_message(
+        snapshot.latest_checkpoint_action(&engine),
+        "that commit carries no checkpoint action",
+    );
 }
 
 async fn assert_replay_errors_on_both_paths(

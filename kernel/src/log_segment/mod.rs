@@ -925,15 +925,39 @@ impl LogSegment {
         stats_schema: Option<&StructType>,
         partition_schema: Option<&StructType>,
     ) -> KernelResult<ActionsWithCheckpointInfo<Box<dyn KernelResultIterator<ActionsBatch>>>> {
+        // `replay` expects commit files to be sorted in descending order, so the return value here
+        // is correct
+        self.read_files_with_projected_checkpoint_actions(
+            engine,
+            &self.find_commit_cover(),
+            commit_read_schema,
+            checkpoint_read_schema,
+            meta_predicate,
+            stats_schema,
+            partition_schema,
+        )
+    }
+
+    /// [`Self::read_actions_with_projected_checkpoint_actions`] reading `commit_files` instead of
+    /// the commit cover.
+    #[allow(clippy::too_many_arguments)]
+    fn read_files_with_projected_checkpoint_actions(
+        &self,
+        engine: &dyn Engine,
+        commit_files: &[FileMeta],
+        commit_read_schema: SchemaRef,
+        checkpoint_read_schema: SchemaRef,
+        meta_predicate: Option<PredicateRef>,
+        stats_schema: Option<&StructType>,
+        partition_schema: Option<&StructType>,
+    ) -> KernelResult<ActionsWithCheckpointInfo<Box<dyn KernelResultIterator<ActionsBatch>>>> {
         // Combine the action-presence predicate with the caller's skipping predicate so readers
         // can omit checkpoint data that cannot contain a relevant action.
         let projection_predicate = checkpoint_action_projection_predicate(&checkpoint_read_schema);
         let checkpoint_predicate =
             combine_checkpoint_predicates(projection_predicate, meta_predicate);
 
-        // `replay` expects commit files to be sorted in descending order, so the return value here
-        // is correct
-        let commit_stream = self.read_commit_actions(engine, commit_read_schema)?;
+        let commit_stream = Self::read_commit_files(engine, commit_files, commit_read_schema)?;
 
         let checkpoint_result = self.create_checkpoint_stream(
             engine,
