@@ -637,16 +637,39 @@ impl PmCandidate {
     /// its higher-versioned value, so the order batches merge in only matters on a version tie,
     /// where `other` wins.
     fn merge(self, other: PmCandidate) -> Self {
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let brings_amt = other.checkpoint.is_some() || other.last_manifest_commit.is_some();
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let checkpoint = newer(self.checkpoint, other.checkpoint);
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let last_manifest_commit = {
+            let tagged = |pointer: LastManifestCommit| (pointer.version, pointer);
+            newer(
+                self.last_manifest_commit.map(tagged),
+                other.last_manifest_commit.map(tagged),
+            )
+            .map(|(_, pointer)| pointer)
+        };
+        // The pointer and the checkpoint action it names can come from different batches, in
+        // either order. Once both are known, use the action's nested P&M as candidates at its
+        // `checkpointMetadata.version`.
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let (pointed_protocol, pointed_metadata) = match (&checkpoint, &last_manifest_commit) {
+            (Some((commit, action)), Some(pointer)) if brings_amt && *commit == pointer.version => {
+                let (protocol, metadata) = checkpoint_pm(action);
+                (Some(protocol), Some(metadata))
+            }
+            _ => (None, None),
+        };
+        #[cfg(not(feature = "adaptive-metadata-in-dev"))]
+        let (pointed_protocol, pointed_metadata) = (None, None);
         PmCandidate {
-            protocol: newer(self.protocol, other.protocol),
-            metadata: newer(self.metadata, other.metadata),
+            protocol: newer(newer(self.protocol, other.protocol), pointed_protocol),
+            metadata: newer(newer(self.metadata, other.metadata), pointed_metadata),
             #[cfg(feature = "adaptive-metadata-in-dev")]
-            checkpoint: newer(self.checkpoint, other.checkpoint),
+            checkpoint,
             #[cfg(feature = "adaptive-metadata-in-dev")]
-            last_manifest_commit: newer_pointer(
-                self.last_manifest_commit,
-                other.last_manifest_commit,
-            ),
+            last_manifest_commit,
         }
     }
 
@@ -791,16 +814,6 @@ fn newer<T>(a: Option<(i64, T)>, b: Option<(i64, T)>) -> Option<(i64, T)> {
         }
         (a, b) => a.or(b),
     }
-}
-
-/// The pointer naming the newer manifest commit, as for [`newer`].
-#[cfg(feature = "adaptive-metadata-in-dev")]
-fn newer_pointer(
-    a: Option<LastManifestCommit>,
-    b: Option<LastManifestCommit>,
-) -> Option<LastManifestCommit> {
-    let tagged = |pointer: LastManifestCommit| (pointer.version, pointer);
-    newer(a.map(tagged), b.map(tagged)).map(|(_, pointer)| pointer)
 }
 
 /// The commit and checkpoint read schemas for P&M replay; the commit schema also reads the AMT
@@ -1307,6 +1320,26 @@ mod tests {
                 merged.last_manifest_commit,
                 Some(LastManifestCommit::new(expected_version, expected_content_root).unwrap())
             );
+        }
+
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        #[rstest]
+        fn test_merge_folds_pointed_pm_in_either_order(#[values(false, true)] action_first: bool) {
+            let with_pointer = PmCandidate {
+                last_manifest_commit: Some(LastManifestCommit::new(2, 2).unwrap()),
+                ..Default::default()
+            };
+            let with_action = PmCandidate {
+                checkpoint: Some((2, minimal_checkpoint_action("root.parquet", 2).unwrap())),
+                ..Default::default()
+            };
+            let merged = if action_first {
+                with_action.merge(with_pointer)
+            } else {
+                with_pointer.merge(with_action)
+            };
+            assert_eq!(merged.protocol.map(|(v, _)| v), Some(2));
+            assert_eq!(merged.metadata.map(|(v, _)| v), Some(2));
         }
     }
 }
