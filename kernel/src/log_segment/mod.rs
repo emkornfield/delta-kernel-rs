@@ -925,8 +925,6 @@ impl LogSegment {
         stats_schema: Option<&StructType>,
         partition_schema: Option<&StructType>,
     ) -> KernelResult<ActionsWithCheckpointInfo<Box<dyn KernelResultIterator<ActionsBatch>>>> {
-        // `replay` expects commit files to be sorted in descending order, so the return value here
-        // is correct
         self.read_files_with_projected_checkpoint_actions(
             engine,
             &self.find_commit_cover(),
@@ -938,8 +936,8 @@ impl LogSegment {
         )
     }
 
-    /// [`Self::read_actions_with_projected_checkpoint_actions`] reading `commit_files` instead of
-    /// the commit cover.
+    /// Like [`Self::read_actions_with_projected_checkpoint_actions`], but reads `commit_files`
+    /// instead of the segment's commit cover.
     #[allow(clippy::too_many_arguments)]
     fn read_files_with_projected_checkpoint_actions(
         &self,
