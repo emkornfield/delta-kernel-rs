@@ -15,8 +15,6 @@ use super::LogSegment;
 use super::tests::{add_checkpoint_to_store, latest_log_segment};
 use super::{LastManifestCommitResolution, PmResolution};
 #[cfg(feature = "declarative-plans")]
-use crate::Error;
-#[cfg(feature = "declarative-plans")]
 use crate::KernelResult;
 #[cfg(feature = "declarative-plans")]
 use crate::actions::SetTransaction;
