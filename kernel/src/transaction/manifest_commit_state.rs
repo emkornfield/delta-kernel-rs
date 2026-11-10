@@ -45,6 +45,13 @@ impl ManifestCommitState {
                 "manifest commit requires the adaptiveMetadata-preview feature"
             )
         );
+        // Tree building does not yet consume a standalone checkpoint's inline file actions.
+        if let Some(standalone) = read_snapshot.latest_standalone_checkpoint_version(engine)? {
+            return Err(KernelError::unsupported(format!(
+                "manifest commit does not yet support building on the standalone checkpoint at \
+                 version {standalone}"
+            )));
+        }
         // TODO(#2866): tighten this check (checkpoints that spill to sidecars, log compaction, and
         // the precise "since the last manifest commit" semantics) once the manifest-commit write
         // path lands.

@@ -13,7 +13,7 @@ use crate::table_features::{TableFeature, find_max_column_id_in_schema};
 use crate::table_properties::COLUMN_MAPPING_MAX_COLUMN_ID;
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
     minimal_checkpoint_action, setup_table, write_commit_after_manifest_commit,
-    write_manifest_commit,
+    write_manifest_commit, write_standalone_checkpoint,
 };
 use crate::unit_test_utils::{
     MockProtocolBuilder, MockTableConfigurationBuilder, assert_result_error_with_message,
@@ -203,11 +203,38 @@ fn manifest_commit_rejects_standalone_checkpoint_whose_content_root_is_behind() 
         1,
         create_row(&engine, LOG_DOMAIN_METADATA_SCHEMA.clone(), domain_metadata)?,
     )?;
-    let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+    let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
     let (_, checkpointed) = snapshot.checkpoint(&engine, None)?;
     assert_eq!(checkpointed.version(), 2);
-    let result = ManifestCommitState::try_new(&engine, checkpointed, 3, &adaptive_table_config());
-    assert_result_error_with_message(result, "does not currently support delta log commits");
+    // Reloading reads the standalone checkpoint from storage, as a later manifest commit would.
+    let reloaded = Snapshot::builder_for(table_root).build(&engine)?;
+    let result = ManifestCommitState::try_new(&engine, reloaded, 3, &adaptive_table_config());
+    assert_result_error_with_message(
+        result,
+        "does not yet support building on the standalone checkpoint at version 2",
+    );
+    Ok(())
+}
+
+// A standalone checkpoint whose content root covers the snapshot version still cannot be built on:
+// tree building does not yet consume its inline file actions.
+#[test]
+fn manifest_commit_rejects_standalone_checkpoint_at_snapshot_version() -> Result<()> {
+    let (engine, table_root) = setup_table()?;
+    write_manifest_commit(
+        &engine,
+        &table_root,
+        1,
+        minimal_checkpoint_action("metadata/root-v1.parquet", 1)?,
+    )?;
+    write_standalone_checkpoint(&engine, &table_root, 1, false)?;
+    let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+    assert_eq!(snapshot.version(), 1);
+    let result = ManifestCommitState::try_new(&engine, snapshot, 2, &adaptive_table_config());
+    assert_result_error_with_message(
+        result,
+        "does not yet support building on the standalone checkpoint at version 1",
+    );
     Ok(())
 }
 

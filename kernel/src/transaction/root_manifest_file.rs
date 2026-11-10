@@ -38,6 +38,16 @@ impl RootManifestFile {
         dm_changes: &[DomainMetadata],
         set_transactions: &[SetTransaction],
     ) -> KernelResult<CheckpointAction> {
+        if let Some(standalone) = self
+            .read_snapshot
+            .latest_standalone_checkpoint_version(engine)?
+        {
+            return Err(KernelError::unsupported(format!(
+                "root manifest file commit does not yet support building on the standalone \
+                 checkpoint at version {standalone}"
+            )));
+        }
+
         let (base_domain_metadata, base_transactions) = self.scan_non_content_metadata(engine)?;
         let (domain_metadata, transactions) = merge_txns_and_domain_metadata(
             base_domain_metadata,
@@ -98,6 +108,7 @@ mod tests {
         adaptive_metadata_protocol_and_metadata, domain, domain_metadata_line,
         minimal_checkpoint_action, setup_table, txn_line, write_commit,
         write_commit_after_manifest_commit, write_manifest_commit, write_sidecar,
+        write_standalone_checkpoint,
     };
     use crate::unit_test_utils::{
         MockTableConfigurationBuilder, assert_result_error_with_message, parse_json_batch,
@@ -513,6 +524,42 @@ mod tests {
         )?;
         assert!(checkpoint.domain_metadata.is_empty());
         assert!(checkpoint.transactions.is_empty());
+        Ok(())
+    }
+
+    // A standalone checkpoint covering the snapshot version passes the content root check, but a
+    // root manifest must still not be built on it.
+    #[test]
+    fn compute_checkpoint_action_rejects_standalone_checkpoint() -> Result<()> {
+        let (engine, table_root) = setup_table()?;
+        write_manifest_commit(
+            &engine,
+            &table_root,
+            1,
+            minimal_checkpoint_action("metadata/root-v1.parquet", 1)?,
+        )?;
+        write_standalone_checkpoint(&engine, &table_root, 1, false)?;
+        let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
+        let file = FileMeta {
+            location: table_root
+                .join("metadata/root-v2.parquet")
+                .map_err(KernelError::from)?,
+            last_modified: 0,
+            size: 1024,
+        };
+        let manifest = RootManifestFile::new(file, snapshot.clone());
+
+        let result = manifest.compute_checkpoint_action(
+            &engine,
+            2,
+            snapshot.table_configuration(),
+            &[],
+            &[],
+        );
+        assert_result_error_with_message(
+            result,
+            "does not yet support building on the standalone checkpoint at version 1",
+        );
         Ok(())
     }
 
