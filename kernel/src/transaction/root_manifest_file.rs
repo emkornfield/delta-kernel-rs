@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
+use crate::action_reconciliation::merge_txns_and_domain_metadata;
 use crate::actions::visitors::SetTransactionMap;
 use crate::actions::{CheckpointAction, ContentRoot, DomainMetadata, SetTransaction};
 use crate::crc::{DomainMetadataState, SetTransactionState, merge_domain_metadata};
@@ -45,27 +45,15 @@ impl RootManifestFile {
         dm_changes: &[DomainMetadata],
         set_transactions: &[SetTransaction],
     ) -> KernelResult<CheckpointAction> {
-        let (mut domain_metadata, mut transactions, existing_checkpoint) =
+        let (base_domain_metadata, base_transactions, existing_checkpoint) =
             self.scan_non_content_metadata(engine)?;
-
-        // Domains can be tombstoned, so merging applies removals. The transactions map is keyed by
-        // app id, so extend overwrites with the newest entry per app.
-        merge_domain_metadata(
-            &mut domain_metadata,
-            dm_changes
-                .iter()
-                .cloned()
-                .map(|dm| (dm.domain().to_string(), dm)),
-        );
-        transactions.extend(
-            set_transactions
-                .iter()
-                .cloned()
-                .map(|txn| (txn.app_id.clone(), txn)),
-        );
-        let expiration_timestamp =
-            calculate_transaction_expiration_timestamp(table_config.table_properties())?;
-        transactions.retain(|_, txn| !txn.is_expired(expiration_timestamp));
+        let (domain_metadata, transactions) = merge_txns_and_domain_metadata(
+            base_domain_metadata,
+            base_transactions,
+            dm_changes.iter().cloned(),
+            set_transactions.iter().cloned(),
+            table_config.table_properties(),
+        )?;
 
         let read_snapshot_version = version_as_i64(self.read_snapshot.version())?;
         if let Some(existing) = &existing_checkpoint {

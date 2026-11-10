@@ -21,6 +21,12 @@ use std::time::Duration;
 
 use crate::table_properties::TableProperties;
 use crate::{KernelError, KernelResult};
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::{
+    actions::{DomainMetadata, SetTransaction, visitors::SetTransactionMap},
+    crc::merge_domain_metadata,
+    log_segment::DomainMetadataMap,
+};
 
 #[cfg(feature = "declarative-plans")]
 pub(crate) mod checkpoint_shape;
@@ -133,6 +139,35 @@ pub(crate) fn calculate_transaction_expiration_timestamp(
             Ok(now_ms - expiration_ms)
         })
         .transpose()
+}
+
+/// Folds newest-wins changes into a base set of domain metadata and set transactions, such as
+/// those of a checkpoint or of the snapshot's active state. Domain tombstones remove their domain,
+/// and transactions past the table's retention are dropped.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+pub(crate) fn merge_txns_and_domain_metadata(
+    mut domain_metadata: DomainMetadataMap,
+    mut transactions: SetTransactionMap,
+    dm_changes: impl IntoIterator<Item = DomainMetadata>,
+    set_transactions: impl IntoIterator<Item = SetTransaction>,
+    table_properties: &TableProperties,
+) -> KernelResult<(DomainMetadataMap, SetTransactionMap)> {
+    // Domains can be tombstoned, so merging applies removals. The transactions map is keyed by
+    // app id, so extend overwrites with the newest entry per app.
+    merge_domain_metadata(
+        &mut domain_metadata,
+        dm_changes
+            .into_iter()
+            .map(|dm| (dm.domain().to_string(), dm)),
+    );
+    transactions.extend(
+        set_transactions
+            .into_iter()
+            .map(|txn| (txn.app_id.clone(), txn)),
+    );
+    let expiration_timestamp = calculate_transaction_expiration_timestamp(table_properties)?;
+    transactions.retain(|_, txn| !txn.is_expired(expiration_timestamp));
+    Ok((domain_metadata, transactions))
 }
 
 #[cfg(test)]
