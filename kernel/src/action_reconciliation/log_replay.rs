@@ -48,6 +48,9 @@ pub(crate) enum RemoveRetention {
     /// Expires removes whose `deletionTimestamp` is at or before the given timestamp in
     /// milliseconds. A remove without a `deletionTimestamp` counts as expired.
     ExpireAtOrBefore(i64),
+    /// Drops every remove action. Removes still cancel older adds of the same file.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    DropAll,
 }
 
 /// Filters log segment actions for action reconciliation.
@@ -438,11 +441,7 @@ impl ActionReconciliationVisitor<'_> {
     /// - If deletion_timestamp <= the policy timestamp: Expired (exclude)
     /// - If deletion_timestamp > the policy timestamp: Valid (include)
     /// - If deletion_timestamp is missing: Defaults to 0, treated as expired (exclude)
-    fn is_expired_tombstone<'a>(
-        &self,
-        i: usize,
-        getter: &'a dyn GetData<'a>,
-    ) -> KernelResult<bool> {
+    fn drops_remove<'a>(&self, i: usize, getter: &'a dyn GetData<'a>) -> KernelResult<bool> {
         match self.remove_retention {
             RemoveRetention::ExpireAtOrBefore(minimum_timestamp) => {
                 // A missing deletionTimestamp defaults to 0 and is treated as expired, matching
@@ -452,6 +451,8 @@ impl ActionReconciliationVisitor<'_> {
 
                 Ok(deletion_timestamp <= minimum_timestamp)
             }
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            RemoveRetention::DropAll => Ok(true),
         }
     }
 
@@ -486,7 +487,7 @@ impl ActionReconciliationVisitor<'_> {
         } else if is_add {
             self.add_actions_count += 1;
             true
-        } else if self.is_expired_tombstone(i, getters[Self::REMOVE_DELETION_TIMESTAMP.index])? {
+        } else if self.drops_remove(i, getters[Self::REMOVE_DELETION_TIMESTAMP.index])? {
             false
         } else {
             self.remove_actions_count += 1;
