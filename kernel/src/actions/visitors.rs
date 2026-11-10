@@ -860,7 +860,8 @@ impl RowVisitor for CheckpointVisitor {
             if let Some(elements) = getters[0].get_struct_list(i, CHECKPOINT_ACTION_NAME)? {
                 let mut element_visitor = CheckpointElementVisitor::default();
                 elements.visit_with(&mut element_visitor)?;
-                self.checkpoint = Some(element_visitor.into_checkpoint_action()?);
+                self.checkpoint =
+                    Some(element_visitor.into_checkpoint_action("checkpoint action")?);
                 // Keep the first checkpoint row found; this only extracts one action, it is not
                 // the RFC's checkpoint selection rule (MAX checkpointMetadata.version across
                 // commits, standalone checkpoints, and _last_checkpoint).
@@ -949,11 +950,11 @@ static CHECKPOINT_ELEMENT_RANGES: LazyLock<CheckpointElementRanges> =
 /// only a convention.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[derive(Default)]
-struct CheckpointElementVisitor {
-    version: Option<i64>,
-    content_root: Option<ContentRoot>,
-    protocol: Option<Protocol>,
-    metadata: Option<Metadata>,
+pub(crate) struct CheckpointElementVisitor {
+    versions: Vec<i64>,
+    content_roots: Vec<ContentRoot>,
+    protocols: Vec<Protocol>,
+    metadatas: Vec<Metadata>,
     transactions: Vec<SetTransaction>,
     domain_metadata: Vec<DomainMetadata>,
     txn_sidecars: Vec<Sidecar>,
@@ -962,19 +963,15 @@ struct CheckpointElementVisitor {
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
 impl CheckpointElementVisitor {
-    /// Assemble the visited elements into a [`CheckpointAction`], erroring if a required element
-    /// was absent or if `CheckpointAction::validate` rejects the assembled action.
-    fn into_checkpoint_action(self) -> KernelResult<CheckpointAction> {
-        let missing = |field: &str| {
-            KernelError::generic(format!(
-                "checkpoint action is missing required `{field}` element"
-            ))
-        };
+    /// Assemble the visited elements into a [`CheckpointAction`]. The four required elements must
+    /// each appear exactly once, and `CheckpointAction::validate` must accept the result. `source`
+    /// names what the elements came from, for error messages.
+    pub(crate) fn into_checkpoint_action(self, source: &str) -> KernelResult<CheckpointAction> {
         let action = CheckpointAction {
-            version: self.version.ok_or_else(|| missing("checkpointMetadata"))?,
-            content_root: self.content_root.ok_or_else(|| missing("contentRoot"))?,
-            protocol: self.protocol.ok_or_else(|| missing("protocol"))?,
-            metadata: self.metadata.ok_or_else(|| missing("metaData"))?,
+            version: exactly_one(self.versions, "checkpointMetadata", source)?,
+            content_root: exactly_one(self.content_roots, "contentRoot", source)?,
+            protocol: exactly_one(self.protocols, "protocol", source)?,
+            metadata: exactly_one(self.metadatas, "metaData", source)?,
             transactions: self.transactions,
             domain_metadata: self.domain_metadata,
             txn_sidecars: self.txn_sidecars,
@@ -999,15 +996,15 @@ impl CheckpointElementVisitor {
         if let Some(version) =
             getters[r.checkpoint_metadata.start].get_opt(row_index, "checkpointMetadata.version")?
         {
-            set_once(&mut self.version, version, "checkpointMetadata")?;
+            self.versions.push(version);
         } else if let Some(content_root) =
             visit_content_root_at(row_index, &getters[r.content_root.clone()])?
         {
-            set_once(&mut self.content_root, content_root, "contentRoot")?;
+            self.content_roots.push(content_root);
         } else if let Some(protocol) = visit_protocol_at(row_index, &getters[r.protocol.clone()])? {
-            set_once(&mut self.protocol, protocol, "protocol")?;
+            self.protocols.push(protocol);
         } else if let Some(metadata) = visit_metadata_at(row_index, &getters[r.metadata.clone()])? {
-            set_once(&mut self.metadata, metadata, "metaData")?;
+            self.metadatas.push(metadata);
         } else if let Some(domain) =
             getters[r.domain_metadata.start].get_opt(row_index, "domainMetadata.domain")?
         {
@@ -1057,16 +1054,20 @@ impl RowVisitor for CheckpointElementVisitor {
     }
 }
 
-/// Store `value` in `slot`, erroring if it was already occupied. Checkpoint elements named by
-/// `name` are singletons, so a second occurrence is malformed rather than an override.
+/// The only value in `values`. Checkpoint elements named by `name` are singletons, so any other
+/// count is malformed rather than an override or a default.
 #[cfg(feature = "adaptive-metadata-in-dev")]
-fn set_once<T>(slot: &mut Option<T>, value: T, name: &str) -> KernelResult<()> {
-    if slot.replace(value).is_some() {
-        return Err(KernelError::generic(format!(
-            "duplicate `{name}` element in checkpoint action"
-        )));
+fn exactly_one<T>(values: Vec<T>, name: &str, source: &str) -> KernelResult<T> {
+    let count = values.len();
+    match <[T; 1]>::try_from(values) {
+        Ok([value]) => Ok(value),
+        Err(_) if count == 0 => Err(KernelError::generic(format!(
+            "{source} is missing required `{name}` element"
+        ))),
+        Err(_) => Err(KernelError::generic(format!(
+            "{source} has {count} `{name}` elements, expected exactly one"
+        ))),
     }
-    Ok(())
 }
 
 /// Get a [`ContentRoot`] out of engine data. Returns `Ok(None)` when the (required) `path` leaf is
@@ -1413,12 +1414,12 @@ mod tests {
     #[case::duplicate_metadata(&[
         checkpoint_elements::CHECKPOINT_METADATA, checkpoint_elements::CONTENT_ROOT,
         checkpoint_elements::PROTOCOL, checkpoint_elements::METADATA, checkpoint_elements::METADATA,
-    ], "duplicate `metaData` element in checkpoint action")]
+    ], "checkpoint action has 2 `metaData` elements, expected exactly one")]
     #[case::duplicate_checkpoint_metadata(&[
         checkpoint_elements::CHECKPOINT_METADATA, checkpoint_elements::CHECKPOINT_METADATA,
         checkpoint_elements::CONTENT_ROOT, checkpoint_elements::PROTOCOL,
         checkpoint_elements::METADATA,
-    ], "duplicate `checkpointMetadata` element in checkpoint action")]
+    ], "checkpoint action has 2 `checkpointMetadata` elements, expected exactly one")]
     // Missing a required element.
     #[case::missing_protocol(&[
         checkpoint_elements::CHECKPOINT_METADATA, checkpoint_elements::CONTENT_ROOT,
@@ -1434,7 +1435,10 @@ mod tests {
     ], "checkpoint action is missing required `metaData` element")]
     // Empty `checkpoint: []` array -> the first required element checked (checkpointMetadata) is
     // reported missing.
-    #[case::empty_array(&[], "checkpoint action is missing required `checkpointMetadata` element")]
+    #[case::empty_array(
+        &[],
+        "checkpoint action is missing required `checkpointMetadata` element"
+    )]
     // Unsupported sidecar `type`.
     #[case::bad_sidecar_type(&[
         checkpoint_elements::CHECKPOINT_METADATA, checkpoint_elements::CONTENT_ROOT,

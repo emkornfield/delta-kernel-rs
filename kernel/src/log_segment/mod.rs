@@ -55,6 +55,8 @@ use crate::{
 mod crc_replay;
 mod domain_metadata_replay;
 mod protocol_metadata_replay;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+mod standalone_checkpoint;
 
 pub(crate) use domain_metadata_replay::{DomainMetadataMap, scan_domain_metadata_actions};
 #[cfg(feature = "adaptive-metadata-in-dev")]
