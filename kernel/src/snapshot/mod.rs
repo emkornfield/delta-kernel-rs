@@ -19,7 +19,6 @@ use crate::actions::{CheckpointAction, LastManifestCommit};
 use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX, LOG_DOMAIN_METADATA_SCHEMA};
 use crate::checkpoint::{
     CheckpointSpec, CheckpointWriter, DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT, V2CheckpointConfig,
-    ensure_checkpoint_supported,
 };
 use crate::clustering::{CLUSTERING_DOMAIN_NAME, ClusteringColumnInfo, parse_clustering_columns};
 use crate::committer::{Committer, PublishMetadata};
@@ -50,6 +49,8 @@ use crate::table_properties::CheckConstraint;
 use crate::table_properties::TableProperties;
 use crate::transaction::{UpdateTableOperation, UpdateTableTransactionBuilder};
 use crate::utils::require;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::version_as_i64;
 use crate::{
     Engine, KernelError, KernelResult, KernelResultIterator, LogCompactionWriter, Version,
 };
@@ -1398,8 +1399,7 @@ impl Snapshot {
     ///
     /// # Errors
     ///
-    /// Returns an error if Kernel does not support reading or writing the table, if Kernel does
-    /// not support standalone checkpoints for the table (an adaptiveMetadata tree), or if the
+    /// Returns an error if Kernel does not support reading or writing the table, or if the
     /// snapshot is not published.
     pub fn create_checkpoint_writer(
         self: Arc<Self>,
@@ -1612,8 +1612,6 @@ impl Snapshot {
     ///
     /// # Errors
     /// - If Kernel does not support reading or writing the table.
-    /// - If the table has an adaptiveMetadata metadata tree: Kernel does not yet support standalone
-    ///   checkpoints for such tables.
     /// - If `CheckpointSpec::V2` is used but the table does not support the `v2Checkpoint` feature.
     /// - If `CheckpointSpec::V1` is used but the table supports `v2Checkpoint` feature. Note: the
     ///   Delta protocol permits writing V1 checkpoints to such tables; this is a kernel limitation.
@@ -1642,7 +1640,7 @@ impl Snapshot {
         engine: &dyn Engine,
         spec: Option<&CheckpointSpec>,
     ) -> KernelResult<(CheckpointWriteResult, SnapshotRef)> {
-        if self.log_segment.checkpoint_version == Some(self.log_segment.end_version) {
+        if self.checkpoint_covers_version(engine)? {
             info!(
                 "Checkpoint already exists for snapshot version {}",
                 self.version()
@@ -1654,9 +1652,6 @@ impl Snapshot {
             self.version(),
             spec
         );
-
-        // Reject before validating `spec` so this error wins regardless of the requested format.
-        ensure_checkpoint_supported(self, engine)?;
 
         let v2_supported = self
             .table_configuration()
@@ -1688,6 +1683,8 @@ impl Snapshot {
         }
 
         let writer = Arc::clone(self).create_checkpoint_writer(engine)?;
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let standalone_action = writer.standalone_action().cloned();
 
         let write_result = match spec {
             Some(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
@@ -1725,16 +1722,33 @@ impl Snapshot {
             .try_new_with_checkpoint(checkpoint_log_path)?;
         // Carry only an at-version CRC forward: the checkpoint drops the commits below it, so a
         // stale base could no longer be advanced over them.
-        Ok((
-            CheckpointWriteResult::Written,
-            Arc::new(Snapshot::new_with_crc(
-                new_log_segment,
-                self.table_configuration().clone(),
-                self.crc_at_version().cloned(),
-                self.built_as_latest,
-                false, /* skipped_new_checkpoints */
-            )?),
-        ))
+        let new_snapshot = Snapshot::new_with_crc(
+            new_log_segment,
+            self.table_configuration().clone(),
+            self.crc_at_version().cloned(),
+            self.built_as_latest,
+            false, /* skipped_new_checkpoints */
+        )?;
+        // The standalone file holds the action inline, so the new snapshot need not read it back.
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        if let Some(action) = standalone_action {
+            let _ = new_snapshot.checkpoint_action.set(Some(Arc::new(action)));
+        }
+        Ok((CheckpointWriteResult::Written, Arc::new(new_snapshot)))
+    }
+
+    /// Whether a checkpoint at this snapshot's version already exists: either a listed checkpoint
+    /// file, or an adaptiveMetadata checkpoint action that covers this version.
+    #[cfg_attr(not(feature = "adaptive-metadata-in-dev"), allow(unused_variables))]
+    fn checkpoint_covers_version(&self, engine: &dyn Engine) -> KernelResult<bool> {
+        if self.log_segment.checkpoint_version == Some(self.log_segment.end_version) {
+            return Ok(true);
+        }
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        if let Some(action) = self.latest_checkpoint_action(engine)? {
+            return Ok(action.version >= version_as_i64(self.version())?);
+        }
+        Ok(false)
     }
 
     /// Publishes all catalog commits at this table version. Applicable only to catalog-managed

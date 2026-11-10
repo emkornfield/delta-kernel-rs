@@ -6,6 +6,8 @@
 //! domain metadata state is the latest checkpoint action's state, merged with the changes in
 //! `(checkpointMetadata.version, n]`.
 
+use std::iter;
+
 use itertools::Itertools;
 
 use super::{
@@ -16,19 +18,22 @@ use crate::action_reconciliation::file_metadata::build_checkpoint_read_schema;
 use crate::action_reconciliation::log_replay::{
     ActionReconciliationBatch, ActionReconciliationProcessor, RemoveRetention,
 };
-use crate::action_reconciliation::merge_txns_and_domain_metadata;
+use crate::action_reconciliation::{ActionReconciliationIterator, merge_txns_and_domain_metadata};
 use crate::actions::set_transaction::scan_application_transactions;
 use crate::actions::{CheckpointAction, LOG_DOMAIN_METADATA_SCHEMA, LOG_TXN_SCHEMA};
 use crate::content_tree::read_checkpoint_action;
+use crate::engine_data::FilteredEngineData;
 use crate::log_replay::HasSelectionVector;
 use crate::log_segment::scan_domain_metadata_actions;
 use crate::path::LogRoot;
+use crate::schema::SchemaRef;
 use crate::snapshot::SnapshotRef;
 use crate::{Engine, KernelError, KernelResult, KernelResultIterator, Version, version_as_i64};
 
-/// Returns the reconciled file actions of the commits in `(action.contentRoot.version, n]`, where
-/// `snapshot` is at version n and `action` is its latest checkpoint action. Each batch is in the
-/// checkpoint output schema, so it can be chained with the standalone checkpoint's other rows.
+/// Returns the output schema and the reconciled file actions of the commits in
+/// `(action.contentRoot.version, n]`, where `snapshot` is at version n and `action` is its latest
+/// checkpoint action. The batches are in the output schema, so they can be chained with the
+/// standalone checkpoint's other rows.
 ///
 /// Every remove in the window is kept, including removes that cancel an add in the window. Adds
 /// and removes are copied verbatim.
@@ -36,13 +41,16 @@ use crate::{Engine, KernelError, KernelResult, KernelResultIterator, Version, ve
 /// # Errors
 ///
 /// Returns an error if `snapshot` was checkpointed by a standalone checkpoint, whose inline file
-/// actions are not yet carried into the window, or if the table uses collation-aware stats.
-#[allow(dead_code)]
-pub(crate) fn gap_file_actions(
+/// actions are not yet carried into the window, or if the table writes collation-aware stats as a
+/// struct.
+pub(super) fn gap_file_actions(
     snapshot: &SnapshotRef,
     engine: &dyn Engine,
     action: &CheckpointAction,
-) -> KernelResult<impl KernelResultIterator<ActionReconciliationBatch>> {
+) -> KernelResult<(
+    SchemaRef,
+    impl KernelResultIterator<ActionReconciliationBatch> + use<>,
+)> {
     ensure_listed_checkpoint_below(snapshot, action)?;
     let window_start = non_negative_version(action.content_root_version(), "Content root version")?;
 
@@ -62,7 +70,7 @@ pub(crate) fn gap_file_actions(
         &context.stats_schema,
         context.partition_schema.as_deref(),
     )?;
-    let (_, evaluator) =
+    let (output_schema, evaluator) =
         checkpoint_output_transform(engine, &context, &read_schema, &context.stats_schema)?;
 
     // TODO: log compaction files spanning the content root version must not feed this window.
@@ -81,7 +89,28 @@ pub(crate) fn gap_file_actions(
     let reconciled = actions
         .map(move |batch| processor.process_actions_batch(batch?))
         .filter_ok(HasSelectionVector::has_selected_rows);
-    Ok(transform_batches(reconciled, evaluator))
+    Ok((output_schema, transform_batches(reconciled, evaluator)))
+}
+
+/// Returns the data of the standalone checkpoint at `action`'s version, with the output schema of
+/// its batches: the reconciled gap file actions, then one batch of the non-file rows.
+pub(super) fn standalone_checkpoint_data(
+    snapshot: &SnapshotRef,
+    engine: &dyn Engine,
+    action: CheckpointAction,
+) -> KernelResult<(ActionReconciliationIterator, SchemaRef)> {
+    let (output_schema, gap) = gap_file_actions(snapshot, engine, &action)?;
+    let rows = action.into_standalone_rows(engine, &output_schema)?;
+    let non_file = ActionReconciliationBatch {
+        actions_count: rows.len() as i64,
+        filtered_data: FilteredEngineData::with_all_rows_selected(rows),
+        add_actions_count: 0,
+    };
+    let batches = iter::once(Ok(non_file)).chain(gap);
+    Ok((
+        ActionReconciliationIterator::new(Box::new(batches)),
+        output_schema,
+    ))
 }
 
 /// Computes the non-file state of the standalone checkpoint at `snapshot`'s version n, as a
@@ -96,7 +125,6 @@ pub(crate) fn gap_file_actions(
 /// # Errors
 ///
 /// Returns an error if `snapshot` has a listed checkpoint file at or after `base`'s version.
-#[allow(dead_code)]
 pub(super) fn compute_standalone_non_file_state(
     snapshot: &SnapshotRef,
     engine: &dyn Engine,
@@ -320,8 +348,8 @@ mod tests {
             .build(engine)
             .unwrap();
         let action = snapshot.latest_checkpoint_action(engine).unwrap().unwrap();
-        gap_file_actions(&snapshot, engine, &action)
-            .unwrap()
+        let (_, batches) = gap_file_actions(&snapshot, engine, &action).unwrap();
+        batches
             .map(|batch| {
                 batch
                     .unwrap()

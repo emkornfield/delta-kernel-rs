@@ -126,14 +126,14 @@ use crate::actions::{
     SIDECAR_FIELD, single_action_row,
 };
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::actions::{CONTENT_ROOT_FIELD, CONTENT_SIDECAR_FIELD};
+use crate::actions::{CONTENT_ROOT_FIELD, CONTENT_SIDECAR_FIELD, CheckpointAction};
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::Scalar;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_replay::HasSelectionVector;
 use crate::path::{self, ParsedLogPath};
 use crate::schema::{SchemaRef, StructField, lazy_schema_ref};
-use crate::snapshot::{Snapshot, SnapshotRef};
+use crate::snapshot::SnapshotRef;
 use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
 use crate::{
@@ -147,6 +147,8 @@ mod sidecar;
 mod standalone;
 
 use sidecar::{SidecarSplitter, SingleSidecarDataIterator, create_sidecar_action_batch};
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use standalone::{compute_standalone_non_file_state, standalone_checkpoint_data};
 #[cfg(test)]
 pub(crate) mod tests;
 
@@ -346,7 +348,6 @@ pub(crate) static CHECKPOINT_ACTIONS_SCHEMA_V2: LazyLock<SchemaRef> = lazy_schem
 /// Its `sidecar` column carries typed AMT sidecars, so it is the AMT element, not the V2
 /// file-action `sidecar` that the V1 and V2 schemas use.
 #[cfg(feature = "adaptive-metadata-in-dev")]
-#[allow(dead_code)]
 pub(crate) static STANDALONE_CHECKPOINT_ACTIONS_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     ..(base_checkpoint_action_fields()),
     (&CHECKPOINT_METADATA_FIELD),
@@ -378,6 +379,11 @@ pub struct CheckpointWriter {
 
     schema_context: CheckpointSchemaContext,
     read_schema: SchemaRef,
+
+    /// The checkpoint action at this version, set when the table has a metadata tree. Such a table
+    /// is checkpointed as a standalone file instead of by the classic path.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    standalone_action: Option<CheckpointAction>,
 }
 
 impl RetentionCalculator for CheckpointWriter {
@@ -393,11 +399,30 @@ impl CheckpointWriter {
             .table_configuration()
             .ensure_read_write_supported()?;
 
-        ensure_checkpoint_supported(&snapshot, engine)?;
-
         // We disallow checkpointing if the Snapshot is not published. If we didn't, this could
         // create gaps in the version history, thereby breaking old readers.
         snapshot.log_segment().validate_published()?;
+
+        // The RFC forbids classic checkpoints once adaptiveMetadata is enabled. A table without a
+        // metadata tree has no content root to bound replay with, so it still gets one.
+        // TODO: amend the RFC to allow classic checkpoints until the first manifest commit.
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let standalone_action = match snapshot.latest_checkpoint_action(engine)? {
+            Some(base) => {
+                // Checkpoint versions must increase, so the new action cannot reuse the base's
+                // version.
+                let version = version_as_i64(snapshot.version())?;
+                if base.version() >= version {
+                    return Err(KernelError::checkpoint_write(format!(
+                        "Cannot checkpoint version {version}: the latest checkpoint action is at \
+                         version {}, and checkpoint versions must increase",
+                        base.version()
+                    )));
+                }
+                Some(compute_standalone_non_file_state(&snapshot, engine, &base)?)
+            }
+            None => None,
+        };
 
         let schema_context = Self::checkpoint_schema_context(&snapshot, engine)?;
         let read_schema = build_checkpoint_read_schema(
@@ -410,7 +435,16 @@ impl CheckpointWriter {
             snapshot,
             schema_context,
             read_schema,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            standalone_action,
         })
+    }
+
+    /// Returns the action that the standalone checkpoint at this version carries, or `None` if
+    /// this writer writes a classic checkpoint.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) fn standalone_action(&self) -> Option<&CheckpointAction> {
+        self.standalone_action.as_ref()
     }
 
     /// Returns the URL where the checkpoint file should be written.
@@ -474,8 +508,9 @@ impl CheckpointWriter {
 
     /// Returns which remove actions this checkpoint keeps.
     fn remove_retention(&self) -> KernelResult<RemoveRetention> {
-        // Reconciled adaptiveMetadata state carries no removes (RFC "Action Reconciliation").
-        // ensure_checkpoint_supported guarantees there is no metadata tree to supply them.
+        // Reconciled adaptiveMetadata state carries no removes (RFC "Action Reconciliation"). Only
+        // a table without a metadata tree reaches this classic path, so no content root
+        // needs them.
         #[cfg(feature = "adaptive-metadata-in-dev")]
         if self
             .snapshot
@@ -494,6 +529,11 @@ impl CheckpointWriter {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<(ActionReconciliationIterator, SchemaRef)> {
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        if let Some(action) = &self.standalone_action {
+            return standalone_checkpoint_data(&self.snapshot, engine, action.clone());
+        }
+
         // Read actions from log segment
         let actions = self
             .snapshot
@@ -577,11 +617,18 @@ impl CheckpointWriter {
             return Ok(());
         }
 
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let standalone = self.standalone_action.is_some();
+        #[cfg(not(feature = "adaptive-metadata-in-dev"))]
+        let standalone = false;
+        // A standalone file holds only the adds of its window, so a count would undercount the
+        // table's files.
+        let num_of_add_files = (!standalone).then_some(last_checkpoint_stats.num_of_add_files);
         let data = create_last_checkpoint_data(
             engine,
             self.version,
             last_checkpoint_stats.num_actions,
-            last_checkpoint_stats.num_of_add_files,
+            num_of_add_files,
             last_checkpoint_stats.size_in_bytes,
         );
 
@@ -824,29 +871,6 @@ fn transform_batches(
     })
 }
 
-/// Returns an error if Kernel does not support writing a checkpoint for the snapshot. An
-/// adaptiveMetadata table without a metadata tree gets the checkpoint format its features enable;
-/// one with a tree is not yet supported.
-#[cfg_attr(not(feature = "adaptive-metadata-in-dev"), allow(unused_variables))]
-pub(crate) fn ensure_checkpoint_supported(
-    snapshot: &Snapshot,
-    engine: &dyn Engine,
-) -> KernelResult<()> {
-    // Without a metadata tree there is no content root to reference, so a classic checkpoint is
-    // the only way to bound replay. The RFC forbids classic checkpoints once adaptiveMetadata is
-    // enabled; TODO: amend it to allow them until the first manifest commit.
-    // TODO(#3683): write standalone checkpoints for adaptiveMetadata tables with a metadata tree.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    if let Some(action) = snapshot.latest_checkpoint_action(engine)? {
-        return Err(KernelError::unsupported(format!(
-            "Standalone checkpoints are not yet supported for tables with an adaptiveMetadata \
-             tree (latest checkpoint action at version {})",
-            action.version
-        )));
-    }
-    Ok(())
-}
-
 /// Creates the data for the _last_checkpoint file containing checkpoint metadata. Factored out to
 /// facilitate testing.
 ///
@@ -854,7 +878,7 @@ pub(crate) fn ensure_checkpoint_supported(
 /// - `engine`: Engine for data processing
 /// - `version`: Table version number
 /// - `actions_counter`: Total actions count
-/// - `add_actions_counter`: Add actions count
+/// - `add_actions_counter`: Add actions count, or `None` to leave it out
 /// - `size_in_bytes`: Size of the checkpoint file in bytes
 ///
 /// # Returns
@@ -873,7 +897,7 @@ pub(crate) fn create_last_checkpoint_data(
     engine: &dyn Engine,
     version: i64,
     actions_counter: i64,
-    add_actions_counter: i64,
+    add_actions_counter: Option<i64>,
     size_in_bytes: i64,
 ) -> KernelResult<Box<dyn EngineData>> {
     engine.evaluation_handler().create_many(

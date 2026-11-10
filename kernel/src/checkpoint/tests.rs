@@ -9,6 +9,10 @@ use test_utils::assert_result_error_with_message;
 use test_utils::{TestAction, actions_to_string, add_commit, delta_path_for_version};
 use url::Url;
 
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::Engine;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::EngineData;
 use crate::action_reconciliation::{
     ActionReconciliationIterator, ActionReconciliationIteratorState, DEFAULT_RETENTION_SECS,
     deleted_file_retention_timestamp_with_time,
@@ -19,16 +23,27 @@ use crate::actions::{
     PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME, SIDECAR_NAME,
 };
 use crate::actions::{Add, Metadata, Protocol, Remove};
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::actions::{CheckpointAction, DomainMetadata, SetTransaction};
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::arrow::array::StringArray;
 use crate::arrow::array::{
     Array, AsArray, Int64Array, MapArray, RecordBatch, StructArray, create_array,
 };
 use crate::arrow::datatypes::{DataType, Field, Schema};
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::arrow::json::WriterBuilder;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::arrow::json::writer::JsonArray;
 use crate::checkpoint::{
     CHECKPOINT_ACTIONS_SCHEMA_V2, CheckpointWriter, LastCheckpointHintStats,
     create_last_checkpoint_data,
 };
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::checkpoint::{CheckpointSpec, STANDALONE_CHECKPOINT_ACTIONS_SCHEMA, V2CheckpointConfig};
+use crate::checkpoint::{
+    CheckpointSpec, LAST_CHECKPOINT_SCHEMA, STANDALONE_CHECKPOINT_ACTIONS_SCHEMA,
+    V2CheckpointConfig,
+};
 use crate::committer::FileSystemCommitter;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use crate::engine::sync::SyncEngine;
@@ -47,11 +62,12 @@ use crate::transaction::create_table::create_table;
 use crate::unit_test_utils::Action;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
-    minimal_checkpoint_action, setup_table, write_manifest_commit,
+    minimal_checkpoint_action, setup_table, write_commit_after_manifest_commit,
+    write_manifest_commit,
 };
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::unit_test_utils::{
-    adaptive_metadata_table_configuration, test_schema_flat_with_column_mapping,
+    adaptive_metadata_table_configuration, parse_json_batch, test_schema_flat_with_column_mapping,
 };
 use crate::{FileMeta, KernelError, KernelResult, LogPath, Result, Snapshot};
 
@@ -193,7 +209,7 @@ fn test_create_last_checkpoint_data() -> KernelResult<()> {
         &engine,
         version,
         total_actions_counter,
-        add_actions_counter,
+        Some(add_actions_counter),
         size_in_bytes,
     )?;
 
@@ -812,24 +828,174 @@ async fn test_adaptive_metadata_table_without_tree_rejects_v2_checkpoint() -> Re
     Ok(())
 }
 
+/// Converts the rows of `data` to JSON objects, one per row. Null fields are omitted.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn json_rows(
+    data: impl IntoIterator<Item = KernelResult<Box<dyn EngineData>>>,
+) -> KernelResult<Vec<Value>> {
+    let batches = data
+        .into_iter()
+        .map(|batch| batch?.try_into_record_batch())
+        .collect::<KernelResult<Vec<RecordBatch>>>()?;
+    let mut writer = WriterBuilder::new().build::<_, JsonArray>(Vec::new());
+    writer.write_batches(&batches.iter().collect::<Vec<_>>())?;
+    writer.finish()?;
+    Ok(from_slice(&writer.into_inner())?)
+}
+
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[rstest::rstest]
-fn test_no_standalone_checkpoint_on_adaptive_metadata_table_with_tree(
+fn test_standalone_checkpoint_on_adaptive_metadata_table_with_tree(
     #[values(None, Some(CheckpointSpec::V1))] spec: Option<CheckpointSpec>,
 ) -> Result<()> {
     let (engine, table_root) = setup_table()?;
-    write_manifest_commit(
+    let checkpoint = minimal_checkpoint_action("metadata/root.parquet", 1)?;
+    let content_root = checkpoint.content_root.clone();
+    write_manifest_commit(&engine, &table_root, 1, checkpoint)?;
+
+    let commit = |actions: Vec<Value>| {
+        let lines: Vec<String> = actions.iter().map(Value::to_string).collect();
+        parse_json_batch(StringArray::from(lines))
+    };
+    let add = |path: &str| {
+        json!({ "add": { "path": path, "partitionValues": {}, "size": 1,
+                         "modificationTime": 0, "dataChange": true } })
+    };
+    // AMT removes may carry a null deletionTimestamp; the remove of `tree.parquet` does.
+    // The commit at 3 removes `b`, which cancels the add of `b` in the window.
+    write_commit_after_manifest_commit(
         &engine,
         &table_root,
+        2,
         1,
-        minimal_checkpoint_action("metadata/root.parquet", 1)?,
+        commit(vec![
+            add("a"),
+            add("b"),
+            json!({ "remove": { "path": "tree.parquet", "dataChange": true } }),
+            json!({ "txn": { "appId": "app", "version": 1 } }),
+            json!({ "domainMetadata": { "domain": "user.dm", "configuration": "cfg",
+                                        "removed": false } }),
+        ]),
+    )?;
+    write_commit_after_manifest_commit(
+        &engine,
+        &table_root,
+        3,
+        1,
+        commit(vec![
+            json!({ "remove": { "path": "b", "dataChange": true } }),
+        ]),
     )?;
 
-    let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
-    let message = "Standalone checkpoints are not yet supported for tables with an \
-                   adaptiveMetadata tree (latest checkpoint action at version 1)";
-    assert_result_error_with_message(snapshot.checkpoint(&engine, spec.as_ref()), message);
-    assert_result_error_with_message(snapshot.create_checkpoint_writer(&engine), message);
+    let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
+    let (result, checkpointed) = snapshot.checkpoint(&engine, spec.as_ref())?;
+    assert_eq!(result, CheckpointWriteResult::Written);
+
+    // The file holds one top-level action per row: the checkpoint metadata, the content root
+    // copied from the manifest commit, the protocol and metaData, the window's txn and domain
+    // metadata, and the window's file actions.
+    let checkpoint_url = table_root
+        .join("_delta_log/00000000000000000003.checkpoint.parquet")
+        .unwrap();
+    let checkpoint_meta = engine.storage_handler().head(&checkpoint_url)?;
+    let checkpoint_size = checkpoint_meta.size;
+    let rows = json_rows(engine.parquet_handler().read_parquet_files(
+        &[checkpoint_meta],
+        STANDALONE_CHECKPOINT_ACTIONS_SCHEMA.clone(),
+        None,
+    )?)?;
+    assert!(
+        rows.iter()
+            .all(|row| row.as_object().is_some_and(|o| o.len() == 1))
+    );
+    // The six non-file rows come first, so a reader can take the protocol, metadata, and content
+    // root from a prefix of the file.
+    assert!(
+        rows[..6]
+            .iter()
+            .all(|row| row.get("add").is_none() && row.get("remove").is_none())
+    );
+    let action_values = |name: &str| -> Vec<Value> {
+        rows.iter()
+            .filter_map(|row| row.get(name).cloned())
+            .collect()
+    };
+    let file_paths = |name: &str| -> Vec<String> {
+        let mut paths: Vec<String> = action_values(name)
+            .iter()
+            .map(|action| action["path"].as_str().unwrap().to_string())
+            .collect();
+        paths.sort();
+        paths
+    };
+    assert_eq!(
+        action_values("checkpointMetadata"),
+        [json!({ "version": 3 })]
+    );
+    assert_eq!(
+        action_values("contentRoot"),
+        [json!({ "path": "metadata/root.parquet", "sizeInBytes": 1024, "version": 1 })]
+    );
+    assert_eq!(action_values("protocol").len(), 1);
+    assert_eq!(action_values("metaData").len(), 1);
+    assert_eq!(
+        action_values("txn"),
+        [json!({ "appId": "app", "version": 1 })]
+    );
+    assert_eq!(
+        action_values("domainMetadata"),
+        [json!({ "domain": "user.dm", "configuration": "cfg", "removed": false })]
+    );
+    assert_eq!(file_paths("add"), ["a"]);
+    assert_eq!(file_paths("remove"), ["b", "tree.parquet"]);
+    assert!(
+        action_values("remove")
+            .iter()
+            .all(|remove| remove.get("deletionTimestamp").is_none())
+    );
+
+    // The hint names the standalone file and omits numOfAddFiles, which would count only the
+    // window's adds. The size counts the 6 non-file rows and the 3 file actions.
+    let last_checkpoint_meta = engine
+        .storage_handler()
+        .head(&table_root.join("_delta_log/_last_checkpoint").unwrap())?;
+    let last_checkpoint = json_rows(engine.json_handler().read_json_files(
+        &[last_checkpoint_meta],
+        LAST_CHECKPOINT_SCHEMA.clone(),
+        None,
+    )?)?;
+    assert_eq!(
+        last_checkpoint,
+        [json!({ "version": 3, "size": 9, "sizeInBytes": checkpoint_size })]
+    );
+
+    // The returned snapshot holds the action the file carries, without re-reading it.
+    let table_config = checkpointed.table_configuration();
+    let expected_action = CheckpointAction::new(
+        3,
+        content_root,
+        table_config.protocol().clone(),
+        table_config.metadata().clone(),
+        vec![SetTransaction::new("app".to_string(), 1, None)],
+        vec![DomainMetadata::new(
+            "user.dm".to_string(),
+            "cfg".to_string(),
+        )],
+    );
+    assert_eq!(
+        checkpointed.latest_checkpoint_action(&engine)?.as_deref(),
+        Some(&expected_action)
+    );
+
+    // Checkpointing again at 3 finds the listed checkpoint.
+    let (result, _) = checkpointed.checkpoint(&engine, spec.as_ref())?;
+    assert_eq!(result, CheckpointWriteResult::AlreadyExists);
+    // The manifest commit at 1 carries a checkpoint action at version 1, so 1 is covered too.
+    let manifest_snapshot = Snapshot::builder_for(table_root)
+        .at_version(1)
+        .build(&engine)?;
+    let (result, _) = manifest_snapshot.checkpoint(&engine, spec.as_ref())?;
+    assert_eq!(result, CheckpointWriteResult::AlreadyExists);
     Ok(())
 }
 
@@ -1568,4 +1734,18 @@ fn test_standalone_checkpoint_schema_top_level_fields() {
             "{name} should carry backReference"
         );
     }
+}
+
+/// A writer at a manifest commit would duplicate the version of the checkpoint action that commit
+/// wrote, so the writer is refused up front.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[test]
+fn create_checkpoint_writer_rejects_version_of_existing_checkpoint_action() -> Result<()> {
+    let (engine, table_root) = setup_table()?;
+    let checkpoint = minimal_checkpoint_action("metadata/root.parquet", 1)?;
+    write_manifest_commit(&engine, &table_root, 1, checkpoint)?;
+    let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+    let result = snapshot.create_checkpoint_writer(&engine);
+    assert_result_error_with_message(result, "checkpoint versions must increase");
+    Ok(())
 }

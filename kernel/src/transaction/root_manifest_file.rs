@@ -58,12 +58,12 @@ impl RootManifestFile {
         let read_snapshot_version = version_as_i64(self.read_snapshot.version())?;
         if let Some(existing) = &existing_checkpoint {
             require!(
-                existing.version() >= read_snapshot_version,
+                existing.content_root_version() >= read_snapshot_version,
                 KernelError::generic(format!(
                     "root manifest file commit requires no delta log commits pending replay since \
-                     the last checkpoint; existing checkpoint covers version {} but snapshot is \
-                     at {read_snapshot_version}",
-                    existing.version()
+                     the last checkpoint; existing checkpoint's content root covers version {} but \
+                     snapshot is at {read_snapshot_version}",
+                    existing.content_root_version()
                 ))
             );
         }

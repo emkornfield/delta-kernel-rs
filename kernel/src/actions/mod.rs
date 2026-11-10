@@ -1763,7 +1763,6 @@ impl CheckpointAction {
 
     /// Converts this action into the rows of a standalone checkpoint file: one top-level action per
     /// row, all in `schema`. The row order matches the embedded `checkpoint` array.
-    #[allow(dead_code)]
     pub(crate) fn into_standalone_rows(
         self,
         engine: &dyn Engine,

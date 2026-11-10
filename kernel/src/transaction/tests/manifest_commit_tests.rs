@@ -184,6 +184,33 @@ fn manifest_commit_rejects_delta_commits_after_last_checkpoint() -> Result<()> {
     Ok(())
 }
 
+// A standalone checkpoint at version 2 whose content root is at version 1 leaves commit 2 outside
+// its tree, so a manifest commit must not build on it.
+#[test]
+fn manifest_commit_rejects_standalone_checkpoint_whose_content_root_is_behind() -> Result<()> {
+    let (engine, table_root) = setup_table()?;
+    write_manifest_commit(
+        &engine,
+        &table_root,
+        1,
+        minimal_checkpoint_action("metadata/root-v1.parquet", 1)?,
+    )?;
+    let domain_metadata = DomainMetadata::new("test.domain".to_string(), "{}".to_string());
+    write_commit_after_manifest_commit(
+        &engine,
+        &table_root,
+        2,
+        1,
+        create_row(&engine, LOG_DOMAIN_METADATA_SCHEMA.clone(), domain_metadata)?,
+    )?;
+    let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+    let (_, checkpointed) = snapshot.checkpoint(&engine, None)?;
+    assert_eq!(checkpointed.version(), 2);
+    let result = ManifestCommitState::try_new(&engine, checkpointed, 3, &adaptive_table_config());
+    assert_result_error_with_message(result, "does not currently support delta log commits");
+    Ok(())
+}
+
 // === physical schema source / schema evolution ===
 
 // The leaf writer's physical schema must come from the effective table config passed to try_new,
