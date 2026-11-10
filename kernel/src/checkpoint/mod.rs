@@ -147,6 +147,8 @@ pub(crate) mod metrics;
 mod sidecar;
 #[cfg(all(test, feature = "declarative-plans"))]
 mod spec_tests;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+mod standalone;
 mod types;
 
 #[cfg(feature = "declarative-plans")]
