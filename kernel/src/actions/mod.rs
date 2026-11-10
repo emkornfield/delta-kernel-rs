@@ -213,8 +213,9 @@ pub(crate) static CONTENT_SIDECAR_FIELD: LazyLock<StructField> = LazyLock::new(|
 /// actions embedded in an adaptiveMetadata manifest commit. This schema is the union of every
 /// element type that may appear in that array:
 /// `checkpointMetadata`, `contentRoot`, `protocol`, `metaData`, `domainMetadata`, `txn`, `sidecar`.
+/// It is also the non-file projection of a standalone checkpoint file, whose rows are the elements.
 #[cfg(feature = "adaptive-metadata-in-dev")]
-static CHECKPOINT_ACTION_ELEMENT_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+pub(crate) static CHECKPOINT_ACTION_ELEMENT_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     (&CHECKPOINT_METADATA_FIELD),
     (&CONTENT_ROOT_FIELD),
     (&PROTOCOL_FIELD),

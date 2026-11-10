@@ -16,6 +16,7 @@ use super::tests::{add_checkpoint_to_store, latest_log_segment};
 use super::{LastManifestCommitResolution, LogSegment, PmResolution};
 use crate::actions::{CheckpointAction, ContentRoot, LastManifestCommit, Protocol, SetTransaction};
 use crate::arrow::array::StringArray;
+use crate::checkpoint::STANDALONE_CHECKPOINT_ACTIONS_SCHEMA;
 use crate::committer::FileSystemCommitter;
 use crate::crc::{Crc, FileStats, FileStatsState};
 use crate::engine::sync::SyncEngine;
@@ -34,9 +35,11 @@ use crate::table_features::TableFeature;
 use crate::transaction::UpdateTableOperation;
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
     checkpoint_line, commit_info_line, last_manifest_commit_info, protocol_and_metadata_lines,
+    standalone_checkpoint_rows,
 };
 use crate::unit_test_utils::{
-    adaptive_metadata_table_configuration, parse_json_batch, test_schema_flat_with_column_mapping,
+    adaptive_metadata_table_configuration, parse_json_batch, string_array_to_engine_data,
+    test_schema_flat_with_column_mapping,
 };
 use crate::{
     Engine, EngineData, FileDataReadResultIterator, FileMeta, FileSize, FilteredEngineData,
@@ -1025,12 +1028,9 @@ impl PlanExecutor for RecordingPlanExecutor {
 
 // A standalone checkpoint written after the manifest commit hides that commit from the segment.
 // Replay still resolves P&M from the checkpoint and the newest commit's pointer without reading the
-// pointed commit, which is deleted here, but following the pointer to the action fails because the
-// segment does not list its commit.
-// TODO(#3683): once standalone checkpoints are supported, replay reads the checkpoint action from
-// the checkpoint file and this resolves.
+// pointed commit, which is deleted here. The action is read from the checkpoint file instead.
 #[tokio::test]
-async fn standalone_checkpoint_above_pointed_commit_fails_to_read_its_action() {
+async fn standalone_checkpoint_above_pointed_commit_resolves_its_action() {
     check_standalone_checkpoint_above_pointed_commit(non_plan_engine, resolved_pointer(0, 0)).await;
     #[cfg(feature = "declarative-plans")]
     check_standalone_checkpoint_above_pointed_commit(
@@ -1046,7 +1046,7 @@ async fn check_standalone_checkpoint_above_pointed_commit<E: Engine>(
 ) {
     let pointer = commit_info(Some((0, 0)));
     let (store, table_root) = manifest_commit_table(&[pointer.clone(), pointer]).await;
-    put_pm_checkpoint(&store, 1).await;
+    put_standalone_checkpoint(&store, 1, 0).await;
     store
         .delete(&delta_path_for_version(0, "json"))
         .await
@@ -1062,10 +1062,8 @@ async fn check_standalone_checkpoint_above_pointed_commit<E: Engine>(
     assert_resolved_pointer(resolution, &expected_last_manifest_commit, None);
 
     let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
-    assert_result_error_with_message(
-        snapshot.latest_checkpoint_action(&engine),
-        "this log segment does not list that commit",
-    );
+    let action = snapshot.latest_checkpoint_action(&engine).unwrap().unwrap();
+    assert_eq!((action.version, action.content_root_version()), (1, 0));
 }
 
 // A segment that ends on a checkpoint does not list the commit at that version, so a checkpoint
@@ -1297,6 +1295,23 @@ async fn read_last_checkpoint_action_from_pointer_rejects_commit_outside_segment
     let pointer = LastManifestCommit::new(pointer_version, pointer_version).unwrap();
     let result = log_segment.read_last_checkpoint_action_from_pointer(&engine, &pointer);
     assert_result_error_with_message(result, "this log segment does not list that commit");
+}
+
+// A classic checkpoint at or after the pointed commit hides that commit, so its action cannot be
+// read from the segment.
+#[tokio::test]
+async fn read_last_checkpoint_action_from_pointer_names_covering_checkpoint() {
+    let (store, table_root) = manifest_commit_table(&[]).await;
+    put_pm_checkpoint(&store, 0).await;
+
+    let engine = non_plan_engine(store);
+    let log_segment = latest_log_segment(&table_root, &engine);
+    let pointer = LastManifestCommit::new(0, 0).unwrap();
+    let result = log_segment.read_last_checkpoint_action_from_pointer(&engine, &pointer);
+    assert_result_error_with_message(
+        result,
+        "the checkpoint at version 0 is at or after that commit",
+    );
 }
 
 #[rstest]
@@ -1762,8 +1777,8 @@ async fn snapshot_on_checkpoint_reads_last_manifest_commit_from_commit_file(
     assert_eq!(snapshot.log_segment().checkpoint_version, Some(0));
     let result = snapshot.last_manifest_commit(&engine);
     if delete_commit_file {
-        // TODO(#3683): when the checkpoint is a standalone checkpoint, read lastManifestCommit
-        // from it instead of failing on the missing commit file.
+        // A standalone checkpoint records no lastManifestCommit either, so this stays missing. Its
+        // action still resolves from the file (see the standalone checkpoint read tests).
         assert!(matches!(result, Err(KernelError::MissingVersion(0))));
     } else {
         assert_eq!(
@@ -1771,6 +1786,24 @@ async fn snapshot_on_checkpoint_reads_last_manifest_commit_from_commit_file(
             Some(LastManifestCommit::new(0, 0).unwrap())
         );
     }
+}
+
+// Writes a standalone checkpoint at `version` whose content root is at `content_root_version`.
+async fn put_standalone_checkpoint(store: &Arc<InMemory>, version: u64, content_root_version: i64) {
+    let lines: Vec<String> = standalone_checkpoint_rows(version as i64, content_root_version)
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    let data = SyncEngine::new()
+        .json_handler()
+        .parse_json(
+            string_array_to_engine_data(StringArray::from(lines)),
+            STANDALONE_CHECKPOINT_ACTIONS_SCHEMA.clone(),
+        )
+        .unwrap();
+    add_checkpoint_to_store(store, data, &format!("{version:020}.checkpoint.parquet"))
+        .await
+        .unwrap();
 }
 
 // Writes a parquet checkpoint at `version` holding only top-level protocol and metaData. Kernel

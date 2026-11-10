@@ -478,6 +478,52 @@ pub(crate) mod adaptive_metadata_fixtures {
         Ok((engine, table_root))
     }
 
+    /// The top-level rows of a standalone checkpoint whose checkpoint metadata is at `version` and
+    /// whose content root is at `content_root_version`: the checkpoint metadata, a content root,
+    /// protocol, and metaData.
+    pub(crate) fn standalone_checkpoint_rows(
+        version: i64,
+        content_root_version: i64,
+    ) -> Vec<Value> {
+        let (protocol, metadata) = adaptive_metadata_protocol_and_metadata();
+        vec![
+            serde_json::json!({ "checkpointMetadata": { "version": version } }),
+            serde_json::json!({ "contentRoot": {
+                "path": "metadata/root.parquet", "sizeInBytes": 1024,
+                "version": content_root_version,
+            } }),
+            serde_json::json!({ "protocol": protocol }),
+            serde_json::json!({ "metaData": metadata }),
+        ]
+    }
+
+    /// Writes one parquet batch per entry of `batches` as the standalone checkpoint file at
+    /// `version` of the table at `table_root`. Each entry is the JSON rows of that batch.
+    pub(crate) fn write_standalone_checkpoint_batches(
+        engine: &SyncEngine,
+        table_root: &Url,
+        version: Version,
+        batches: Vec<Vec<Value>>,
+    ) -> KernelResult<()> {
+        let batches = batches
+            .into_iter()
+            .map(|rows| {
+                let json_lines = rows.iter().map(Value::to_string).collect_vec();
+                engine.json_handler().parse_json(
+                    string_array_to_engine_data(StringArray::from(json_lines)),
+                    STANDALONE_CHECKPOINT_ACTIONS_SCHEMA.clone(),
+                )
+            })
+            .collect::<KernelResult<Vec<_>>>()?;
+        let location = table_root
+            .join(&format!("_delta_log/{version:020}.checkpoint.parquet"))
+            .unwrap();
+        engine
+            .parquet_handler()
+            .write_parquet_file(location, Box::new(batches.into_iter().map(Ok)))?;
+        Ok(())
+    }
+
     /// Writes a standalone checkpoint at `version` of the table at `table_root`: the checkpoint
     /// metadata, a `contentRoot` row, protocol and metaData, and a `txn` sidecar row when
     /// `typed_sidecars` is set.
@@ -487,34 +533,15 @@ pub(crate) mod adaptive_metadata_fixtures {
         version: Version,
         typed_sidecars: bool,
     ) -> KernelResult<()> {
-        let (protocol, metadata) = adaptive_metadata_protocol_and_metadata();
         let version_i64 = version_as_i64(version)?;
-        let mut lines = vec![
-            serde_json::json!({ "checkpointMetadata": { "version": version_i64 } }),
-            serde_json::json!({ "contentRoot": {
-                "path": "metadata/root.parquet", "sizeInBytes": 1024, "version": version_i64,
-            } }),
-            serde_json::json!({ "protocol": protocol }),
-            serde_json::json!({ "metaData": metadata }),
-        ];
+        let mut rows = standalone_checkpoint_rows(version_i64, version_i64);
         if typed_sidecars {
-            lines.push(serde_json::json!({ "sidecar": {
+            rows.push(serde_json::json!({ "sidecar": {
                 "type": "txn", "path": "txn-sidecar.parquet", "sizeInBytes": 100,
                 "modificationTime": 1,
             } }));
         }
-        let json_lines = lines.iter().map(Value::to_string).collect_vec();
-        let data = engine.json_handler().parse_json(
-            string_array_to_engine_data(StringArray::from(json_lines)),
-            STANDALONE_CHECKPOINT_ACTIONS_SCHEMA.clone(),
-        )?;
-        let location = table_root
-            .join(&format!("_delta_log/{version:020}.checkpoint.parquet"))
-            .unwrap();
-        engine
-            .parquet_handler()
-            .write_parquet_file(location, Box::new(iter::once(Ok(data))))?;
-        Ok(())
+        write_standalone_checkpoint_batches(engine, table_root, version, vec![rows])
     }
 
     /// Writes a JSON commit at `version` containing `data`.

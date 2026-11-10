@@ -55,11 +55,14 @@ use crate::{
 mod crc_replay;
 mod domain_metadata_replay;
 mod protocol_metadata_replay;
-
+#[cfg(feature = "adaptive-metadata-in-dev")]
+mod standalone_checkpoint;
 pub(crate) use domain_metadata_replay::{DomainMetadataMap, scan_domain_metadata_actions};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 pub(crate) use protocol_metadata_replay::LastManifestCommitResolution;
 pub(crate) use protocol_metadata_replay::PmResolution;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+pub(crate) use standalone_checkpoint::read_standalone_checkpoint_action_for_pointer;
 
 #[cfg(test)]
 mod crc_tests;
@@ -1080,12 +1083,9 @@ impl LogSegment {
         engine: &dyn Engine,
         pointer: &LastManifestCommit,
     ) -> KernelResult<CheckpointAction> {
-        let commit = self.find_pointed_commit(pointer).ok_or_else(|| {
-            last_manifest_commit_inconsistency(
-                pointer,
-                "this log segment does not list that commit",
-            )
-        })?;
+        let commit = self
+            .find_pointed_commit(pointer)
+            .ok_or_else(|| self.unlisted_pointed_commit_error(pointer))?;
         let files = std::slice::from_ref(&commit.location);
         let batches =
             engine
@@ -1095,6 +1095,28 @@ impl LogSegment {
             .ok_or_else(|| missing_pointed_checkpoint_action(pointer))?;
         require_pointed_checkpoint_action(pointer, &action)?;
         Ok(action)
+    }
+
+    /// Why the commit `pointer` names is not listed. A checkpoint at or after that commit hides
+    /// it from the segment, so its action is not readable from here.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn unlisted_pointed_commit_error(&self, pointer: &LastManifestCommit) -> KernelError {
+        let covering_checkpoint = self.checkpoint_version.filter(|&checkpoint| {
+            Version::try_from(pointer.version).is_ok_and(|version| version <= checkpoint)
+        });
+        match covering_checkpoint {
+            Some(checkpoint) => last_manifest_commit_inconsistency(
+                pointer,
+                format!(
+                    "the checkpoint at version {checkpoint} is at or after that commit, so the log \
+                     segment does not list it"
+                ),
+            ),
+            None => last_manifest_commit_inconsistency(
+                pointer,
+                "this log segment does not list that commit",
+            ),
+        }
     }
 
     /// The listed commit at `pointer`'s version, or `None` when this segment does not list it.

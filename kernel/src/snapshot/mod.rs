@@ -10,6 +10,8 @@ use delta_kernel_derive::internal_api;
 use tracing::{debug, error, info, instrument, warn};
 use url::Url;
 
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::FileMeta;
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
 use crate::actions::set_transaction::SetTransactionScanner;
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -31,6 +33,8 @@ use crate::incremental_scan::IncrementalScanBuilder;
 use crate::log_replay::ActionsBatch;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::log_segment::LastManifestCommitResolution;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::log_segment::read_standalone_checkpoint_action_for_pointer;
 use crate::log_segment::{
     DomainMetadataMap, LogSegment, PmResolution, scan_domain_metadata_actions,
 };
@@ -269,8 +273,9 @@ impl Snapshot {
     }
 
     /// `captured_checkpoint_action` is the latest checkpoint action when the build already has it
-    /// in hand; `None` means not captured, not known absent. A captured action is trusted as is,
-    /// without checking it against `lastManifestCommit`.
+    /// in hand; `None` means not captured, not known absent. A captured action is trusted without
+    /// checking it against `lastManifestCommit`, unless it is not newer than the listed checkpoint,
+    /// in which case the lazy lookup decides.
     /// `last_manifest_commit` is how the build resolved `lastManifestCommit` without the CRC. A CRC
     /// at the snapshot version takes precedence, since it records the value authoritatively,
     /// including its absence.
@@ -299,6 +304,9 @@ impl Snapshot {
             (None, LastManifestCommitResolution::Resolved(resolved)) => OnceLock::from(resolved),
             (None, LastManifestCommitResolution::Unresolved) => OnceLock::new(),
         };
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let superseding_captured_action = captured_checkpoint_action
+            .filter(|action| captured_action_supersedes_checkpoint(&log_segment, action));
         Self {
             span,
             log_segment,
@@ -307,7 +315,7 @@ impl Snapshot {
             built_as_latest,
             skipped_new_checkpoints,
             #[cfg(feature = "adaptive-metadata-in-dev")]
-            checkpoint_action: match captured_checkpoint_action {
+            checkpoint_action: match superseding_captured_action {
                 Some(action) => OnceLock::from(Some(action)),
                 None => OnceLock::new(),
             },
@@ -318,14 +326,19 @@ impl Snapshot {
 
     /// The latest AMT `checkpoint` action this snapshot covers, or `None` when the table has no
     /// checkpoint action at this version (a classic non-AMT table, or an AMT table that has none
-    /// yet). Served from memory when the build captured it; otherwise read from the manifest
-    /// commit that [`Self::last_manifest_commit`] names, so the log is never scanned.
+    /// yet). Served from memory when the build captured it. Otherwise it is read from the
+    /// standalone checkpoint file this segment lists, unless a later manifest commit supersedes
+    /// that file, or else from the manifest commit that [`Self::last_manifest_commit`] names.
+    ///
+    /// A standalone checkpoint's content root is checked against `lastManifestCommit` when that
+    /// is known. On a snapshot at its standalone checkpoint whose commit file and CRC are gone,
+    /// the pointer is unknown, so the action is read from the file without that check.
     ///
     /// # Errors
-    /// Returns an error if `lastManifestCommit` or the manifest commit cannot be read, or if the
-    /// pointer and the log disagree. On an AMT-enabled snapshot, the pointer comes only from the
-    /// CRC or the `commitInfo` at this version, so a snapshot with neither (a classic checkpoint
-    /// without its commit) yields [`KernelError::MissingVersion`].
+    /// Returns an error if the action cannot be read, or if the pointer and the log disagree.
+    /// Without a standalone checkpoint, the pointer comes only from the CRC or the `commitInfo`
+    /// at this version, so a classic checkpoint whose commit is gone yields
+    /// [`KernelError::MissingVersion`].
     #[cfg(feature = "adaptive-metadata-in-dev")]
     pub(crate) fn latest_checkpoint_action(
         &self,
@@ -337,16 +350,52 @@ impl Snapshot {
         if let Some(cached) = self.checkpoint_action.get() {
             return Ok(cached.clone());
         }
-        let found = match self.last_manifest_commit(engine)? {
-            Some(pointer) => Some(Arc::new(
-                self.log_segment
-                    .read_last_checkpoint_action_from_pointer(engine, &pointer)?,
-            )),
-            None => None,
-        };
-        // A concurrent caller may win the race to fill the cell; both read the same commit.
-        let _ = self.checkpoint_action.set(found.clone());
-        Ok(found)
+        let resolved = match self.checkpoint_source(engine)? {
+            CheckpointSource::None => None,
+            CheckpointSource::Standalone { file, pointer } => Some(
+                read_standalone_checkpoint_action_for_pointer(engine, &file, pointer.as_ref())?,
+            ),
+            CheckpointSource::ManifestCommit {
+                pointer,
+                superseded_standalone,
+            } => {
+                let action = self
+                    .log_segment
+                    .read_last_checkpoint_action_from_pointer(engine, &pointer)?;
+                if let Some(standalone) = superseded_standalone {
+                    require!(
+                        action.version > standalone,
+                        KernelError::invalid_log_segment(format!(
+                            "lastManifestCommit names manifest commit version {} whose checkpoint \
+                             action has checkpointMetadata.version {}, which does not exceed the \
+                             standalone checkpoint at version {standalone} that it supersedes",
+                            pointer.version, action.version
+                        ))
+                    );
+                }
+                Some(action)
+            }
+        }
+        .map(Arc::new);
+        // A concurrent caller may win the race to fill the cell; both read the same file.
+        let _ = self.checkpoint_action.set(resolved.clone());
+        Ok(resolved)
+    }
+
+    /// The version of the standalone checkpoint that [`Self::latest_checkpoint_action`] reads
+    /// from, or `None` when the latest checkpoint action is not a standalone checkpoint's.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) fn latest_standalone_checkpoint_version(
+        &self,
+        engine: &dyn Engine,
+    ) -> KernelResult<Option<Version>> {
+        if !self.has_adaptive_metadata() {
+            return Ok(None);
+        }
+        Ok(match self.checkpoint_source(engine)? {
+            CheckpointSource::Standalone { file, .. } => Some(file.version),
+            CheckpointSource::None | CheckpointSource::ManifestCommit { .. } => None,
+        })
     }
 
     /// Reads this snapshot's log with `schema`, newest first, for log replay. For a table with an
@@ -1266,6 +1315,39 @@ impl Snapshot {
         Ok((in_commit_timestamp, last_manifest_commit))
     }
 
+    /// Decides where the latest checkpoint action is read from. The listed standalone checkpoint
+    /// wins unless `lastManifestCommit` is newer than it.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn checkpoint_source(&self, engine: &dyn Engine) -> KernelResult<CheckpointSource> {
+        let standalone = self.log_segment.standalone_checkpoint(engine)?;
+        let pointer = match self.last_manifest_commit(engine) {
+            Ok(pointer) => pointer,
+            // A snapshot on its standalone checkpoint, with that commit and no CRC, has no pointer
+            // to check. The file alone holds the action.
+            Err(KernelError::MissingVersion(_)) if standalone.is_some() => None,
+            Err(err) => return Err(err),
+        };
+        let Some(file) = standalone else {
+            return Ok(match pointer {
+                Some(pointer) => CheckpointSource::ManifestCommit {
+                    pointer,
+                    superseded_standalone: None,
+                },
+                None => CheckpointSource::None,
+            });
+        };
+        let file_version = version_as_i64(file.version)?;
+        match pointer {
+            Some(pointer) if pointer.version > file_version => {
+                Ok(CheckpointSource::ManifestCommit {
+                    pointer,
+                    superseded_standalone: Some(file_version),
+                })
+            }
+            pointer => Ok(CheckpointSource::Standalone { file, pointer }),
+        }
+    }
+
     /// Get the timestamp for this snapshot's version, in milliseconds since the Unix epoch.
     ///
     /// When In-Commit Timestamp (ICT) are enabled, returns the In-Commit Timestamp value.
@@ -1820,6 +1902,41 @@ impl Snapshot {
             self.skipped_new_checkpoints,
         )?))
     }
+}
+
+/// Whether a checkpoint action that replay captured is newer than the listed checkpoint. A captured
+/// action that is not is dropped, so the lazy lookup reads and checks it instead: skipping a
+/// capture never changes the result, only where it comes from.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn captured_action_supersedes_checkpoint(
+    log_segment: &LogSegment,
+    action: &CheckpointAction,
+) -> bool {
+    match log_segment.checkpoint_version {
+        None => true,
+        Some(checkpoint) => {
+            version_as_i64(checkpoint).is_ok_and(|version| action.version > version)
+        }
+    }
+}
+
+/// Where [`Snapshot::latest_checkpoint_action`] reads the latest checkpoint action from.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+enum CheckpointSource {
+    /// No checkpoint action at this version.
+    None,
+    /// The listed standalone checkpoint file. `pointer` is the `lastManifestCommit` checked
+    /// against it, or `None` when it cannot be read (see [`Snapshot::latest_checkpoint_action`]).
+    Standalone {
+        file: ParsedLogPath<FileMeta>,
+        pointer: Option<LastManifestCommit>,
+    },
+    /// The manifest commit that `pointer` names. `superseded_standalone` is the version of the
+    /// listed standalone checkpoint that this commit supersedes, if any.
+    ManifestCommit {
+        pointer: LastManifestCommit,
+        superseded_standalone: Option<i64>,
+    },
 }
 
 // TODO: unify this and lots of stuff in LogSegment tests and test_utils.
