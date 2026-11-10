@@ -335,16 +335,20 @@ pub(crate) fn checkpoint_action_batch() -> Box<dyn EngineData> {
 pub(crate) mod adaptive_metadata_fixtures {
     use std::iter;
 
+    use serde_json::Value;
+
     use super::*;
     use crate::actions::{
         CheckpointAction, ContentRoot, LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA,
         LastManifestCommit, Sidecar,
     };
     use crate::arrow::array::{Array as _, AsArray as _};
+    use crate::checkpoint::STANDALONE_CHECKPOINT_ACTIONS_SCHEMA;
     use crate::content_tree::ContentTreeNodeEntry;
     use crate::content_tree::test_utils::write_manifest;
     use crate::engine_data::FilteredEngineData;
     use crate::expressions::Scalar;
+    use crate::object_store::DynObjectStore;
     use crate::path::LogRoot;
     use crate::transaction::UpdateTableOperation;
     use crate::{create_row, version_as_i64};
@@ -456,7 +460,13 @@ pub(crate) mod adaptive_metadata_fixtures {
 
     /// Creates an empty in-memory table and returns its engine and table-root URL.
     pub(crate) fn setup_table() -> Result<(SyncEngine, Url)> {
-        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        setup_table_on(Arc::new(InMemory::new()))
+    }
+
+    /// Creates an empty table on `store`, reachable at `memory:///`, and returns its engine and
+    /// table-root URL.
+    pub(crate) fn setup_table_on(store: Arc<DynObjectStore>) -> Result<(SyncEngine, Url)> {
+        let engine = SyncEngine::new_with_store(store);
         let schema = schema_ref! { nullable "id": INTEGER };
         let _ = create_table("memory:///", schema, "test", true)
             .build(&engine, Box::new(FileSystemCommitter::new()))?
@@ -466,6 +476,45 @@ pub(crate) mod adaptive_metadata_fixtures {
             .table_root()
             .clone();
         Ok((engine, table_root))
+    }
+
+    /// Writes a standalone checkpoint at `version` of the table at `table_root`: the checkpoint
+    /// metadata, a `contentRoot` row, protocol and metaData, and a `txn` sidecar row when
+    /// `typed_sidecars` is set.
+    pub(crate) fn write_standalone_checkpoint(
+        engine: &SyncEngine,
+        table_root: &Url,
+        version: Version,
+        typed_sidecars: bool,
+    ) -> KernelResult<()> {
+        let (protocol, metadata) = adaptive_metadata_protocol_and_metadata();
+        let version_i64 = version_as_i64(version)?;
+        let mut lines = vec![
+            serde_json::json!({ "checkpointMetadata": { "version": version_i64 } }),
+            serde_json::json!({ "contentRoot": {
+                "path": "metadata/root.parquet", "sizeInBytes": 1024, "version": version_i64,
+            } }),
+            serde_json::json!({ "protocol": protocol }),
+            serde_json::json!({ "metaData": metadata }),
+        ];
+        if typed_sidecars {
+            lines.push(serde_json::json!({ "sidecar": {
+                "type": "txn", "path": "txn-sidecar.parquet", "sizeInBytes": 100,
+                "modificationTime": 1,
+            } }));
+        }
+        let json_lines = lines.iter().map(Value::to_string).collect_vec();
+        let data = engine.json_handler().parse_json(
+            string_array_to_engine_data(StringArray::from(json_lines)),
+            STANDALONE_CHECKPOINT_ACTIONS_SCHEMA.clone(),
+        )?;
+        let location = table_root
+            .join(&format!("_delta_log/{version:020}.checkpoint.parquet"))
+            .unwrap();
+        engine
+            .parquet_handler()
+            .write_parquet_file(location, Box::new(iter::once(Ok(data))))?;
+        Ok(())
     }
 
     /// Writes a JSON commit at `version` containing `data`.

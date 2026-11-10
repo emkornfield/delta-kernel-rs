@@ -19,7 +19,7 @@ use crate::actions::visitors::SidecarVisitor;
 use crate::actions::{CheckpointAction, LOG_CHECKPOINT_SCHEMA, LastManifestCommit};
 use crate::actions::{
     LOG_ADD_SCHEMA, SIDECAR_FILE_SCHEMA_TAG, SIDECAR_NAME, Sidecar, action_presence_leaf,
-    schema_contains_file_actions,
+    has_file_action_sidecar_column, schema_contains_file_actions,
 };
 use crate::checkpoint::collation_stats::{
     build_collation_stats_read_transform, source_collation_stats,
@@ -1315,10 +1315,10 @@ impl LogSegment {
     /// - No checkpoint parts: return (None, [])
     /// - Multi-part (always V1, no sidecars): return checkpoint schema directly
     /// - UUID-named JSON (always V2): extract sidecars, read first sidecar's schema
-    /// - Classic-named or UUID-named parquet (V1 or V2): read checkpoint schema from hint or
-    ///   footer, then check for sidecar column to distinguish
-    ///   - Has sidecar column (V2): extract sidecars, read first sidecar's schema
-    ///   - No sidecar column (V1): use checkpoint schema directly
+    /// - Classic-named or UUID-named parquet (V1, V2, or standalone AMT): read checkpoint schema
+    ///   from hint or footer, then check for sidecar column to distinguish
+    ///   - Has sidecar column, not standalone (V2): extract sidecars, read first sidecar's schema
+    ///   - No sidecar column, or standalone (V1): use checkpoint schema directly
     fn get_file_actions_schema_and_sidecars(
         &self,
         engine: &dyn Engine,
@@ -1346,10 +1346,11 @@ impl LogSegment {
             }
             ClassicCheckpoint | UuidCheckpoint if checkpoint.extension.as_str() == "parquet" => {
                 // Parquet checkpoint (classic-named or UUID-named): either can be V1 or V2.
-                // Check for sidecar column to distinguish.
+                // Check for sidecar column to distinguish. A standalone checkpoint's sidecar rows
+                // are AMT sidecars, so it never has V2 file sidecars.
                 let checkpoint_schema =
                     Self::read_checkpoint_schema(engine, checkpoint, hint_schema.as_ref())?;
-                if checkpoint_schema.field(SIDECAR_NAME).is_some() {
+                if has_file_action_sidecar_column(&checkpoint_schema) {
                     self.read_sidecar_schema_and_files(engine, checkpoint, Some(&checkpoint_schema))
                 } else {
                     Ok((Some(checkpoint_schema), vec![]))

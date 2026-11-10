@@ -93,8 +93,29 @@ pub(crate) fn action_presence_leaf(action_name: &str) -> Option<&'static str> {
         SET_TRANSACTION_NAME => Some("appId"),
         DOMAIN_METADATA_NAME => Some("domain"),
         CHECKPOINT_METADATA_NAME => Some("version"),
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        CONTENT_ROOT_NAME => Some("path"),
         _ => None,
     }
+}
+
+/// Whether a checkpoint file's parquet schema marks it as an adaptiveMetadata standalone
+/// checkpoint. Its `sidecar` rows are typed AMT sidecars, not V2 file-action sidecars.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+pub(crate) fn is_standalone_checkpoint_schema(schema: &StructType) -> bool {
+    schema.contains(CONTENT_ROOT_NAME)
+}
+
+/// Without the feature there are no standalone checkpoints.
+#[cfg(not(feature = "adaptive-metadata-in-dev"))]
+pub(crate) fn is_standalone_checkpoint_schema(_schema: &StructType) -> bool {
+    false
+}
+
+/// Whether a checkpoint file's schema holds V2 file-action sidecars. A standalone
+/// adaptiveMetadata checkpoint's `sidecar` rows are typed AMT sidecars instead.
+pub(crate) fn has_file_action_sidecar_column(schema: &StructType) -> bool {
+    schema.contains(SIDECAR_NAME) && !is_standalone_checkpoint_schema(schema)
 }
 
 /// Builds one row of `schema` holding `value` in the top-level field `field_name` and a typed null
@@ -2200,6 +2221,12 @@ mod tests {
     #[case::unknown_action("futureAction", None)]
     fn test_action_presence_leaf(#[case] action_name: &str, #[case] expected_leaf: Option<&str>) {
         assert_eq!(action_presence_leaf(action_name), expected_leaf);
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_content_root_presence_leaf() {
+        assert_eq!(action_presence_leaf(CONTENT_ROOT_NAME), Some("path"));
     }
 
     // duplicated
