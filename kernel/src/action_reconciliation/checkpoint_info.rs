@@ -10,6 +10,7 @@ use crate::actions::visitors::SidecarVisitor;
 use crate::actions::{
     CHECKPOINT_METADATA_FIELD, CHECKPOINT_METADATA_NAME, CHECKPOINT_NUM_ADD_FILES_TAG,
     CheckpointMetadata, SIDECAR_FIELD, SIDECAR_FILE_SCHEMA_TAG, SIDECAR_NAME, Sidecar,
+    has_file_action_sidecar_column,
 };
 use crate::checkpoint::{CHECKPOINT_ACTIONS_SCHEMA_V2, CheckpointInfo, SelectedCheckpointType};
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
@@ -64,12 +65,22 @@ impl CheckpointInfo {
                 if file_type == FileType::Parquet && root_schema.is_none() {
                     root_schema = Some(read_parquet_footer_schema(exec, root.location.clone())?);
                 }
-                let needs_root_read = root_schema.as_ref().is_none_or(|schema| {
-                    schema.contains(SIDECAR_NAME) || schema.contains(CHECKPOINT_METADATA_NAME)
-                });
+                // A standalone checkpoint keeps its file actions inline, and its `sidecar` rows
+                // are typed adaptiveMetadata sidecars rather than file-action sidecars.
+                let reads_sidecars = root_schema
+                    .as_ref()
+                    .is_none_or(|schema| has_file_action_sidecar_column(schema));
+                let needs_root_read = reads_sidecars
+                    || root_schema
+                        .as_ref()
+                        .is_some_and(|schema| schema.contains(CHECKPOINT_METADATA_NAME));
                 if needs_root_read {
-                    let (sidecars, metadata) =
-                        collect_checkpoint_metadata(exec, &root.location, file_type)?;
+                    let (sidecars, metadata) = collect_checkpoint_metadata(
+                        exec,
+                        &root.location,
+                        file_type,
+                        reads_sidecars,
+                    )?;
                     (Cow::Owned(sidecars), metadata.map(Cow::Owned))
                 } else {
                     (Cow::Borrowed([].as_slice()), None)
@@ -222,12 +233,17 @@ fn collect_checkpoint_metadata(
     exec: &dyn PlanExecutor,
     file: &FileMeta,
     file_type: FileType,
+    reads_sidecars: bool,
 ) -> KernelResult<(Vec<Sidecar>, Option<CheckpointMetadata>)> {
-    let schema = schema_ref! { (&SIDECAR_FIELD), (&CHECKPOINT_METADATA_FIELD) };
-    let predicate = Predicate::or(
-        col!(SIDECAR_NAME, "path").is_not_null(),
-        col!(CHECKPOINT_METADATA_NAME, "version").is_not_null(),
-    );
+    let has_metadata = col!(CHECKPOINT_METADATA_NAME, "version").is_not_null();
+    let (schema, predicate) = if reads_sidecars {
+        (
+            schema_ref! { (&SIDECAR_FIELD), (&CHECKPOINT_METADATA_FIELD) },
+            Predicate::or(col!(SIDECAR_NAME, "path").is_not_null(), has_metadata),
+        )
+    } else {
+        (schema_ref! { (&CHECKPOINT_METADATA_FIELD) }, has_metadata)
+    };
     let plan = match file_type {
         FileType::Parquet => PlanBuilder::scan_parquet([file.clone()], &[], schema),
         FileType::Json => PlanBuilder::scan_json([file.clone()], &[], schema),
@@ -239,7 +255,9 @@ fn collect_checkpoint_metadata(
     let mut metadata = CheckpointMetadataVisitor::default();
     for batch in data {
         let batch = batch?;
-        sidecars.visit_rows_of(batch.as_ref())?;
+        if reads_sidecars {
+            sidecars.visit_rows_of(batch.as_ref())?;
+        }
         metadata.visit_rows_of(batch.as_ref())?;
     }
     Ok((sidecars.sidecars, metadata.0))
@@ -301,10 +319,19 @@ mod tests {
     use crate::expressions::Predicate;
     use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpointV2};
     use crate::log_segment_files::LogSegmentFiles;
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::object_store::DynObjectStore;
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::object_store::memory::InMemory;
     use crate::path::LogPathFileType;
     use crate::plans::ir::nodes::Operator;
     use crate::plans::{IoOperation, PlanResult};
     use crate::schema::{schema, schema_ref};
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::unit_test_utils::adaptive_metadata_fixtures::{
+        minimal_checkpoint_action, setup_table_on, write_manifest_commit,
+        write_standalone_checkpoint,
+    };
     use crate::unit_test_utils::{
         copy_test_table, create_log_path, create_log_path_with_size, load_test_table,
     };
@@ -525,6 +552,25 @@ mod tests {
         if omit_hint {
             assert_eq!(exec.query_scans.get(), unhinted_query_scans);
         }
+    }
+
+    /// A standalone checkpoint keeps its file actions inline, so it is a leaf even when its typed
+    /// `sidecar` rows would otherwise make it look like a V2 manifest.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest]
+    fn standalone_checkpoint_is_leaf(#[values(false, true)] typed_sidecars: bool) {
+        let store: Arc<DynObjectStore> = Arc::new(InMemory::new());
+        let (engine, table_root) = setup_table_on(store.clone()).unwrap();
+        let checkpoint = minimal_checkpoint_action("metadata/root.parquet", 1).unwrap();
+        write_manifest_commit(&engine, &table_root, 1, checkpoint).unwrap();
+        write_standalone_checkpoint(&engine, &table_root, 1, typed_sidecars).unwrap();
+
+        let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+        let exec = SyncPlanExecutor::new(Some(store));
+        let shape = CheckpointShape::resolve(&exec, snapshot.log_segment())
+            .unwrap()
+            .unwrap();
+        assert!(shape.sidecars.is_empty());
     }
 
     /// Requested stats schema for the `*-struct-stats-only` fixtures (`id: long`, `value: string`),
