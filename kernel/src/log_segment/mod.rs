@@ -14,6 +14,8 @@ use url::Url;
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::EngineData;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::FileDataReadResultIterator;
 #[cfg(feature = "declarative-plans")]
 use crate::Scalar;
 use crate::actions::visitors::SidecarVisitor;
@@ -43,6 +45,8 @@ use crate::path::LogRoot;
 use crate::path::{LogPathFileType, ParsedLogPath};
 #[cfg(feature = "declarative-plans")]
 use crate::plans::ir::nodes::{FileType, ScanFile};
+#[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
+use crate::plans::{Operation, PlanBuilder, PlanExecutor};
 use crate::schema::compare::SchemaComparison;
 use crate::schema::{
     CheckpointFieldKind, DataType, SchemaRef, StructField, StructType, ToSchema as _,
@@ -1176,11 +1180,8 @@ impl LogSegment {
         let commit = self
             .find_pointed_commit(pointer)
             .ok_or_else(|| self.unlisted_pointed_commit_error(pointer))?;
-        let files = std::slice::from_ref(&commit.location);
         let batches =
-            engine
-                .json_handler()
-                .read_json_files(files, LOG_CHECKPOINT_SCHEMA.clone(), None)?;
+            read_json_action_rows(engine, &commit.location, LOG_CHECKPOINT_SCHEMA.clone())?;
         let action = first_checkpoint_action(batches)?
             .ok_or_else(|| missing_pointed_checkpoint_action(pointer))?;
         require_pointed_checkpoint_action(pointer, &action)?;
@@ -1999,6 +2000,53 @@ fn first_checkpoint_action(
         }
     }
     Ok(None)
+}
+
+/// Reads the parquet `file` as rows of `schema`. Uses the engine's plan executor when it has one,
+/// which reads every row, so `predicate` only prunes row groups on the handler path.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn read_parquet_action_rows(
+    engine: &dyn Engine,
+    file: &FileMeta,
+    schema: SchemaRef,
+    predicate: Option<PredicateRef>,
+) -> KernelResult<FileDataReadResultIterator> {
+    #[cfg(feature = "declarative-plans")]
+    if let Some(executor) = engine.plan_executor() {
+        let scan = PlanBuilder::scan_parquet([file.clone()], &[], schema)?;
+        return execute_action_rows_plan(executor.as_ref(), scan);
+    }
+    engine
+        .parquet_handler()
+        .read_parquet_files(std::slice::from_ref(file), schema, predicate)
+}
+
+/// Reads the JSON commit `file` as rows of `schema`, through the plan executor when the engine has
+/// one.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn read_json_action_rows(
+    engine: &dyn Engine,
+    file: &FileMeta,
+    schema: SchemaRef,
+) -> KernelResult<FileDataReadResultIterator> {
+    #[cfg(feature = "declarative-plans")]
+    if let Some(executor) = engine.plan_executor() {
+        let scan = PlanBuilder::scan_json([file.clone()], &[], schema)?;
+        return execute_action_rows_plan(executor.as_ref(), scan);
+    }
+    engine
+        .json_handler()
+        .read_json_files(std::slice::from_ref(file), schema, None)
+}
+
+/// Runs the scan `scan` as a plan and returns its rows.
+#[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
+fn execute_action_rows_plan(
+    executor: &dyn PlanExecutor,
+    scan: PlanBuilder,
+) -> KernelResult<FileDataReadResultIterator> {
+    let plan = scan.build()?;
+    executor.execute_op(Operation::QueryPlan(plan))?.into_data()
 }
 
 /// Errors unless `action`, read from the manifest commit `pointer` names, has the pointer's content

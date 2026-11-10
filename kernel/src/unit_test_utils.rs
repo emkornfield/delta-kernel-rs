@@ -346,12 +346,14 @@ pub(crate) mod adaptive_metadata_fixtures {
     use crate::checkpoint::STANDALONE_CHECKPOINT_ACTIONS_SCHEMA;
     use crate::content_tree::ContentTreeNodeEntry;
     use crate::content_tree::test_utils::write_manifest;
+    #[cfg(feature = "declarative-plans")]
+    use crate::engine::test_delegating::DelegatingEngine;
     use crate::engine_data::FilteredEngineData;
     use crate::expressions::Scalar;
     use crate::object_store::DynObjectStore;
     use crate::path::LogRoot;
     use crate::transaction::UpdateTableOperation;
-    use crate::{create_row, version_as_i64};
+    use crate::{Engine, create_row, version_as_i64};
 
     /// The protocol and metadata of a minimal adaptiveMetadata table.
     pub(crate) fn adaptive_metadata_protocol_and_metadata() -> (Protocol, Metadata) {
@@ -701,6 +703,26 @@ pub(crate) mod adaptive_metadata_fixtures {
         let table_root = Url::parse("memory:///").unwrap();
         create_adaptive_metadata_table(&engine, &table_root, &[]);
         (engine, table_root)
+    }
+
+    /// An engine over `store` whose reads go through the imperative handlers, not the plan
+    /// executor that `SyncEngine` has under `declarative-plans`. Without that feature every
+    /// `SyncEngine` is already imperative.
+    pub(crate) fn non_plan_engine(store: Arc<InMemory>) -> impl Engine {
+        let engine = SyncEngine::new_with_store(store);
+        #[cfg(feature = "declarative-plans")]
+        let engine = DelegatingEngine::new(Arc::new(engine)).without_plan_executor();
+        engine
+    }
+
+    /// An engine over `store` for reads that go through the plan executor when `plan_executor` is
+    /// set, and through the imperative handlers otherwise.
+    pub(crate) fn reader_engine(store: Arc<InMemory>, plan_executor: bool) -> Box<dyn Engine> {
+        if plan_executor {
+            Box::new(SyncEngine::new_with_store(store))
+        } else {
+            Box::new(non_plan_engine(store))
+        }
     }
 
     /// Commits a transaction on the latest snapshot of the table at `table_root` that adds a

@@ -1,8 +1,6 @@
 //! Reads the checkpoint action of an adaptiveMetadata standalone checkpoint file.
 
-use std::slice;
-
-use super::{LogSegment, checkpoint_action_projection_predicate};
+use super::{LogSegment, checkpoint_action_projection_predicate, read_parquet_action_rows};
 use crate::actions::visitors::CheckpointElementVisitor;
 use crate::actions::{
     CHECKPOINT_ACTION_ELEMENT_SCHEMA, CheckpointAction, LastManifestCommit,
@@ -45,8 +43,9 @@ pub(crate) fn read_standalone_checkpoint_action(
     // The element schema is exactly the non-file columns of a standalone file, so the file's rows
     // project onto it directly. Rows of other kinds read as all-null and are skipped.
     let predicate = checkpoint_action_projection_predicate(&CHECKPOINT_ACTION_ELEMENT_SCHEMA);
-    let batches = engine.parquet_handler().read_parquet_files(
-        slice::from_ref(&file.location),
+    let batches = read_parquet_action_rows(
+        engine,
+        &file.location,
         CHECKPOINT_ACTION_ELEMENT_SCHEMA.clone(),
         predicate,
     )?;
@@ -116,7 +115,7 @@ mod tests {
     use crate::object_store::memory::InMemory;
     use crate::snapshot::{CheckpointWriteResult, Snapshot};
     use crate::unit_test_utils::adaptive_metadata_fixtures::{
-        commit_info_line, last_manifest_commit_info, minimal_checkpoint_action,
+        commit_info_line, last_manifest_commit_info, minimal_checkpoint_action, reader_engine,
         setup_adaptive_metadata_table, setup_table, setup_table_on, standalone_checkpoint_rows,
         write_commit, write_commit_after_manifest_commit, write_manifest_commit, write_sidecar,
         write_standalone_checkpoint_batches,
@@ -135,9 +134,12 @@ mod tests {
         Ok(ParsedLogPath::new(meta).unwrap())
     }
 
-    #[test]
-    fn read_matches_action_returned_by_checkpoint() -> Result<()> {
-        let (engine, table_root) = setup_table()?;
+    #[rstest]
+    fn read_matches_action_returned_by_checkpoint(
+        #[values(false, true)] plan_executor: bool,
+    ) -> Result<()> {
+        let store = Arc::new(InMemory::new());
+        let (engine, table_root) = setup_table_on(store.clone())?;
         write_manifest_commit(
             &engine,
             &table_root,
@@ -160,8 +162,9 @@ mod tests {
         let (result, checkpointed) = snapshot.checkpoint(&engine, None)?;
         assert_eq!(result, CheckpointWriteResult::Written);
 
-        let file = standalone_file(&engine, &table_root, 2)?;
-        let action = read_standalone_checkpoint_action(&engine, &file)?;
+        let reader = reader_engine(store, plan_executor);
+        let file = standalone_file(reader.as_ref(), &table_root, 2)?;
+        let action = read_standalone_checkpoint_action(reader.as_ref(), &file)?;
         assert_eq!(
             Some(&action),
             checkpointed.latest_checkpoint_action(&engine)?.as_deref()
@@ -169,16 +172,25 @@ mod tests {
         Ok(())
     }
 
-    /// Reads a file at `file_version` whose batches are `batches`, and returns its action.
-    fn read_fixture(file_version: Version, batches: Vec<Vec<Value>>) -> Result<CheckpointAction> {
-        let (engine, table_root) = setup_table()?;
+    /// Reads a file at `file_version` whose batches are `batches`, and returns its action. The
+    /// file is read through the plan executor when `plan_executor` is set.
+    fn read_fixture(
+        file_version: Version,
+        batches: Vec<Vec<Value>>,
+        plan_executor: bool,
+    ) -> Result<CheckpointAction> {
+        let store = Arc::new(InMemory::new());
+        let (engine, table_root) = setup_table_on(store.clone())?;
         write_standalone_checkpoint_batches(&engine, &table_root, file_version, batches)?;
         let file = standalone_file(&engine, &table_root, file_version)?;
-        Ok(read_standalone_checkpoint_action(&engine, &file)?)
+        let reader = reader_engine(store, plan_executor);
+        Ok(read_standalone_checkpoint_action(reader.as_ref(), &file)?)
     }
 
-    #[test]
-    fn read_reconstructs_typed_sidecars_across_batches() -> Result<()> {
+    #[rstest]
+    fn read_reconstructs_typed_sidecars_across_batches(
+        #[values(false, true)] plan_executor: bool,
+    ) -> Result<()> {
         let mut rows = standalone_checkpoint_rows(3, 3);
         rows.push(
             json!({ "sidecar": { "type": "txn", "path": "txn-sidecar.parquet",
@@ -189,7 +201,7 @@ mod tests {
                                        "sizeInBytes": 200, "modificationTime": 2 } }),
         );
         let rest = rows.split_off(4);
-        let action = read_fixture(3, vec![rows, rest])?;
+        let action = read_fixture(3, vec![rows, rest], plan_executor)?;
 
         let sidecar_paths =
             |sidecars: &[Sidecar]| sidecars.iter().map(|s| s.path.clone()).collect::<Vec<_>>();
@@ -253,8 +265,9 @@ mod tests {
         #[case] file_version: Version,
         #[case] rows: Vec<Value>,
         #[case] expected: &str,
+        #[values(false, true)] plan_executor: bool,
     ) -> Result<()> {
-        let err = read_fixture(file_version, vec![rows]).unwrap_err();
+        let err = read_fixture(file_version, vec![rows], plan_executor).unwrap_err();
         assert!(
             err.to_string().contains(expected),
             "unexpected error: {err}"
@@ -313,37 +326,49 @@ mod tests {
     fn latest_checkpoint_action_reloaded_from_storage_matches_written_action(
         #[case] write_later_commit: bool,
         #[case] at_version: Option<Version>,
+        #[values(false, true)] plan_executor: bool,
     ) -> Result<()> {
-        let (engine, table_root, written) = write_checkpointed_table(Arc::new(InMemory::new()))?;
+        let store = Arc::new(InMemory::new());
+        let (engine, table_root, written) = write_checkpointed_table(store.clone())?;
         if write_later_commit {
             write_txn_commit_after_manifest_commit(&engine, &table_root, 3)?;
         }
+        let reader = reader_engine(store, plan_executor);
         let snapshot = match at_version {
             Some(version) => Snapshot::builder_for(table_root)
                 .at_version(version)
-                .build(&engine)?,
-            None => Snapshot::builder_for(table_root).build(&engine)?,
+                .build(reader.as_ref())?,
+            None => Snapshot::builder_for(table_root).build(reader.as_ref())?,
         };
         assert_eq!(snapshot.log_segment().checkpoint_version, Some(2));
-        assert_eq!(snapshot.latest_checkpoint_action(&engine)?, Some(written));
+        assert_eq!(
+            snapshot.latest_checkpoint_action(reader.as_ref())?,
+            Some(written)
+        );
         Ok(())
     }
 
     // The commit at 2 is gone and there is no CRC, so the snapshot has no pointer to check. The
     // standalone file still holds the action.
+    #[rstest]
     #[tokio::test]
-    async fn latest_checkpoint_action_reads_file_when_checkpoint_commit_and_crc_are_gone()
-    -> Result<()> {
+    async fn latest_checkpoint_action_reads_file_when_checkpoint_commit_and_crc_are_gone(
+        #[values(false, true)] plan_executor: bool,
+    ) -> Result<()> {
         let store = Arc::new(InMemory::new());
-        let (engine, table_root, written) = write_checkpointed_table(store.clone())?;
+        let (_, table_root, written) = write_checkpointed_table(store.clone())?;
         store
             .delete(&delta_path_for_version(2, "json"))
             .await
             .unwrap();
 
-        let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+        let reader = reader_engine(store, plan_executor);
+        let snapshot = Snapshot::builder_for(table_root).build(reader.as_ref())?;
         assert_eq!(snapshot.version(), 2);
-        assert_eq!(snapshot.latest_checkpoint_action(&engine)?, Some(written));
+        assert_eq!(
+            snapshot.latest_checkpoint_action(reader.as_ref())?,
+            Some(written)
+        );
         Ok(())
     }
 
@@ -373,9 +398,12 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn latest_checkpoint_action_rejects_content_root_that_differs_from_pointer() -> Result<()> {
-        let (engine, table_root) = setup_table()?;
+    #[rstest]
+    fn latest_checkpoint_action_rejects_content_root_that_differs_from_pointer(
+        #[values(false, true)] plan_executor: bool,
+    ) -> Result<()> {
+        let store = Arc::new(InMemory::new());
+        let (engine, table_root) = setup_table_on(store.clone())?;
         write_manifest_commit(
             &engine,
             &table_root,
@@ -398,9 +426,10 @@ mod tests {
             vec![standalone_checkpoint_rows(2, 1)],
         )?;
 
-        let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+        let reader = reader_engine(store, plan_executor);
+        let snapshot = Snapshot::builder_for(table_root).build(reader.as_ref())?;
         assert_result_error_with_message(
-            snapshot.latest_checkpoint_action(&engine),
+            snapshot.latest_checkpoint_action(reader.as_ref()),
             "standalone checkpoint at version 2 has contentRoot.version 1, but lastManifestCommit \
              (manifest commit version 1) has contentRootVersion 0",
         );
@@ -416,8 +445,10 @@ mod tests {
     fn manifest_commit_after_standalone_supersedes_it_or_errors(
         #[case] checkpoint_version: Version,
         #[case] expected_error: Option<&str>,
+        #[values(false, true)] plan_executor: bool,
     ) -> Result<()> {
-        let (engine, table_root, _) = write_checkpointed_table(Arc::new(InMemory::new()))?;
+        let store = Arc::new(InMemory::new());
+        let (engine, table_root, _) = write_checkpointed_table(store.clone())?;
         write_manifest_commit(
             &engine,
             &table_root,
@@ -425,8 +456,9 @@ mod tests {
             minimal_checkpoint_action("metadata/root-v3.parquet", checkpoint_version)?,
         )?;
 
-        let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
-        let result = snapshot.latest_checkpoint_action(&engine);
+        let reader = reader_engine(store, plan_executor);
+        let snapshot = Snapshot::builder_for(table_root).build(reader.as_ref())?;
+        let result = snapshot.latest_checkpoint_action(reader.as_ref());
         match expected_error {
             Some(expected) => assert_result_error_with_message(result, expected),
             None => assert_eq!(result?.map(|action| action.version), Some(3)),

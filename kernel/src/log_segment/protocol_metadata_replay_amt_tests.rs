@@ -34,8 +34,8 @@ use crate::schema::SchemaRef;
 use crate::table_features::TableFeature;
 use crate::transaction::UpdateTableOperation;
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
-    checkpoint_line, commit_info_line, last_manifest_commit_info, protocol_and_metadata_lines,
-    standalone_checkpoint_rows,
+    checkpoint_line, commit_info_line, last_manifest_commit_info, non_plan_engine,
+    protocol_and_metadata_lines, standalone_checkpoint_rows,
 };
 use crate::unit_test_utils::{
     adaptive_metadata_table_configuration, parse_json_batch, string_array_to_engine_data,
@@ -166,15 +166,6 @@ async fn commit_table(commits: &[String]) -> (Arc<InMemory>, Url) {
         .unwrap();
     }
     (store, table_root)
-}
-
-// Removes SyncEngine's plan executor so replay uses the non-plan path even when
-// `declarative-plans` is compiled in. Otherwise SyncEngine would use the plan path.
-fn non_plan_engine(store: Arc<InMemory>) -> impl Engine {
-    let engine = SyncEngine::new_with_store(store);
-    #[cfg(feature = "declarative-plans")]
-    let engine = DelegatingEngine::new(Arc::new(engine)).without_plan_executor();
-    engine
 }
 
 #[tokio::test]
