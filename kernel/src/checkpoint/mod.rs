@@ -136,8 +136,8 @@ use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
 use crate::{
-    Engine, EngineData, FileMeta, KernelError, KernelResult, KernelResultIterator, Result, Version,
-    version_as_i64,
+    Engine, EngineData, ExpressionEvaluator, FileMeta, KernelError, KernelResult,
+    KernelResultIterator, Result, Version, version_as_i64,
 };
 
 pub(crate) mod collation_stats;
@@ -540,35 +540,11 @@ impl CheckpointWriter {
         } else {
             (context.stats_schema.clone(), Vec::new())
         };
-        let (output_schema, transform_expr) = build_checkpoint_transform(
-            &context.stats_config,
-            &self.read_schema,
-            &stats_schema,
-            context.partition_schema.as_ref(),
-        )?;
-
-        // Create the expression evaluator for the checkpoint transform.
         // The transform is applied to reconciled action batches only (not checkpoint metadata).
-        let evaluator = engine.evaluation_handler().new_expression_evaluator(
-            self.read_schema.clone(),
-            transform_expr,
-            output_schema.clone().into(),
-        )?;
-
-        // Apply stats transform to each reconciled batch
+        let (output_schema, evaluator) =
+            checkpoint_output_transform(engine, context, &self.read_schema, &stats_schema)?;
         let checkpoint_data = buffered.into_iter().map(Ok).chain(checkpoint_data);
-        let transformed = checkpoint_data.map(move |batch_result| {
-            let batch = batch_result?;
-            let _timer = metrics.start(CheckpointPhase::StatsTransform);
-            let (data, sv) = batch.filtered_data.into_parts();
-            let transformed = evaluator.evaluate(data.as_ref())?;
-            Ok(ActionReconciliationBatch {
-                filtered_data: FilteredEngineData::try_new(transformed, sv)?,
-                actions_count: batch.actions_count,
-                add_actions_count: batch.add_actions_count,
-                remove_actions_count: batch.remove_actions_count,
-            })
-        });
+        let transformed = transform_batches(checkpoint_data, evaluator, metrics);
 
         // For V2 checkpoints, chain the checkpoint metadata batch after the transformed
         // action stream. The metadata batch is created with the output schema directly,
@@ -845,6 +821,48 @@ impl CheckpointWriter {
             is_v2,
         })
     }
+}
+
+/// Builds the output schema of checkpoint batches read with `read_schema`, and the evaluator
+/// that applies the stats transform to them.
+fn checkpoint_output_transform(
+    engine: &dyn Engine,
+    context: &CheckpointSchemaContext,
+    read_schema: &SchemaRef,
+    stats_schema: &SchemaRef,
+) -> KernelResult<(SchemaRef, Arc<dyn ExpressionEvaluator>)> {
+    let (output_schema, transform_expr) = build_checkpoint_transform(
+        &context.stats_config,
+        read_schema,
+        stats_schema,
+        context.partition_schema.as_ref(),
+    )?;
+    let evaluator = engine.evaluation_handler().new_expression_evaluator(
+        read_schema.clone(),
+        transform_expr,
+        output_schema.clone().into(),
+    )?;
+    Ok((output_schema, evaluator))
+}
+
+/// Applies the checkpoint output transform to the data of each reconciled batch.
+fn transform_batches(
+    batches: impl KernelResultIterator<ActionReconciliationBatch>,
+    evaluator: Arc<dyn ExpressionEvaluator>,
+    metrics: CheckpointMetrics,
+) -> impl KernelResultIterator<ActionReconciliationBatch> {
+    batches.map(move |batch_result| {
+        let batch = batch_result?;
+        let _timer = metrics.start(CheckpointPhase::StatsTransform);
+        let (data, selection) = batch.filtered_data.into_parts();
+        let transformed = evaluator.evaluate(data.as_ref())?;
+        Ok(ActionReconciliationBatch {
+            filtered_data: FilteredEngineData::try_new(transformed, selection)?,
+            actions_count: batch.actions_count,
+            add_actions_count: batch.add_actions_count,
+            remove_actions_count: batch.remove_actions_count,
+        })
+    })
 }
 
 /// Returns an error if Kernel does not support writing a checkpoint for the snapshot. An
