@@ -32,7 +32,7 @@ use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX, LOG_DOMAIN_METADATA
 use crate::checkpoint::CheckpointInfo;
 use crate::checkpoint::{
     CheckpointSpec, CheckpointWriter, DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT,
-    SelectedCheckpointType, V2CheckpointConfig, ensure_standalone_checkpoint_supported,
+    SelectedCheckpointType, V2CheckpointConfig, ensure_checkpoint_supported,
 };
 use crate::clustering::{CLUSTERING_DOMAIN_NAME, ClusteringColumnInfo, parse_clustering_columns};
 use crate::committer::{Committer, PublishMetadata};
@@ -1561,8 +1561,8 @@ impl Snapshot {
     /// # Errors
     ///
     /// Returns an error if Kernel does not support reading or writing the table, if Kernel does
-    /// not support standalone checkpoints for the table (adaptiveMetadata), or if the snapshot is
-    /// not published.
+    /// not support standalone checkpoints for the table (an adaptiveMetadata tree), or if the
+    /// snapshot is not published.
     pub fn create_checkpoint_writer(
         self: Arc<Self>,
         engine: &dyn Engine,
@@ -1867,7 +1867,7 @@ impl Snapshot {
     ///
     /// # Errors
     /// - If Kernel does not support reading or writing the table.
-    /// - If the table has adaptiveMetadata enabled: Kernel does not yet support standalone
+    /// - If the table has an adaptiveMetadata metadata tree: Kernel does not yet support standalone
     ///   checkpoints for such tables.
     /// - If `CheckpointSpec::V2` is used but the table does not support the `v2Checkpoint` feature.
     /// - If `CheckpointSpec::V1` is used but the table supports `v2Checkpoint` feature. Note: the
@@ -1925,7 +1925,7 @@ impl Snapshot {
         );
 
         // Reject before validating `spec` so this error wins regardless of the requested format.
-        ensure_standalone_checkpoint_supported(self.table_configuration())?;
+        ensure_checkpoint_supported(self, engine)?;
 
         let v2_supported = self
             .table_configuration()
