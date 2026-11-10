@@ -76,19 +76,23 @@ Read side:
   the snapshot version n. It has the RFC's row layout and does not write a new root manifest.
 - R2: `contentRoot` is copied verbatim from the latest checkpoint action, including `tags`.
 - R3: Inline file actions are the reconciled `add`/`remove` actions for (contentRoot.version, n].
-  Every remove in that window is kept regardless of tombstone retention, because it may cancel a
-  tree entry.
-- R4: Txn and domain metadata reflect the state at n. A sidecar from the previous checkpoint
-  action is referenced unchanged when none of its keys changed after the previous checkpoint.
-  Otherwise its entries are read, merged, and inlined. A TODO records spilling new entries to
+  The window's lower bound is `contentRoot.version`, not the previous checkpoint version (D8).
+  Every remove in the window is kept, including removes that cancel an add inside the window and
+  removes with a null `deletionTimestamp` (D5, D6). Actions are copied verbatim, including
+  `backReference`, `stats`, and DVs (D7).
+- R4: Txn and domain metadata reflect the state at n. Sidecar reuse is decided per type, all or
+  nothing (D3). When no `txn` (or user `domainMetadata`, including a removal) changed in the
+  window, every sidecar of that type is referenced unchanged. Otherwise all sidecars of that type
+  are read, merged, and inlined. A TODO records spilling new entries to
   sidecars once a sidecar writer exists.
 - R5: `_last_checkpoint` is a classic hint naming the standalone file (`version` n, `size`,
   `sizeInBytes`). It has no `amtCheckpoint` and no `numOfAddFiles`.
 - R6: The snapshot returned by `Snapshot::checkpoint` carries the new checkpoint action.
 - R7: An AMT table with no checkpoint action yet gets the checkpoint format its features enable
   (classic V1 in practice) instead of an error.
-- R8: Checkpointing a snapshot whose version equals the latest checkpoint version returns
-  `AlreadyExists`.
+- R8: Checkpointing at n returns `AlreadyExists` unless n is greater than the greatest known
+  checkpoint version: max(listed checkpoint file, `checkpointMetadata.version` of the latest
+  action) (D4, D9).
 - R9: Readers rebuild a `CheckpointAction` from a standalone checkpoint's rows. A file with a
   `contentRoot` row is a standalone checkpoint, and its `sidecar` rows are AMT sidecars, never V2
   file sidecars.
@@ -126,15 +130,44 @@ Read side:
   `contentRoot` row. Sidecars may or may not be present. (user)
 - Q6: How should the stack be ordered? A6: One linear stack off #3651, write side first. Small
   PRs, with refactors separate from features. (user)
+Q7-Q10 and D1-D9 are provisional decisions from a scovich-style agent review made while the
+author was away. REVISIT each one.
+
 - Q7: The RFC says writers must not produce classic or V2 checkpoints once `adaptiveMetadata` is
   enabled. Does R7 need an RFC change allowing it until the first manifest commit?
-  A7: UNRESOLVED
+  A7 (provisional): Proceed as directed. Guard on "no `lastManifestCommit` as of n", not on the
+  feature being enabled. Put a source comment and TODO on the guard asking for the RFC amendment.
+  A classic no-tree checkpoint drops every remove, since there is nothing to cancel. A later
+  manifest commit whose `checkpointMetadata.version` is below that classic checkpoint fails on
+  the existing listed-checkpoint guard; this is the intended conservative behavior.
 - Q8: Consider a snapshot at S whose commit-S JSON has been cleaned up, with no CRC. There is no
   `lastManifestCommit` source. Should reads proceed from file S, while writes error?
-  A8: UNRESOLVED
-- Q9: Should reused sidecars apply txn expiry, which forces a re-read? A9: UNRESOLVED
+  A8 (provisional): Reads proceed from file S and skip the pointer validation. Writes on a
+  snapshot at exactly S error, naming S and the missing commit and CRC. Snapshots after S are
+  unaffected. The RFC could close the gap by recording `lastManifestCommit` in the file.
+- Q9: Should reused sidecars apply txn expiry, which forces a re-read?
+  A9 (provisional): No. Readers apply expiry at lookup. Expiry applies only to entries that are
+  inlined anyway.
 - Q10: Should readers check that `checkpointMetadata.version` is strictly increasing?
-  A10: UNRESOLVED
+  A10 (provisional): No global scan. Check only pairs already in hand:
+  - standalone `checkpointMetadata.version` == file version;
+  - `contentRoot.version` <= `checkpointMetadata.version`;
+  - a manifest-commit action that supersedes standalone S must have `checkpointMetadata.version`
+    > S, else error naming both versions.
+- D3: Sidecar reuse is per type, all or nothing. A per-sidecar decision would require reading
+  each sidecar to learn its keys.
+- D5: Keep every remove in the window, including ones that cancel an in-window add. A re-add of a
+  tree entry followed by a remove would otherwise resurrect the tree entry.
+- D6: Tombstone retention becomes an explicit policy, e.g.
+  `RemoveRetention { ExpireBefore(ts), KeepAll, DropAll }`. AMT removes may carry a null
+  `deletionTimestamp`, which `is_expired_tombstone` treats as expired.
+- D7: Copy adds and removes verbatim and never synthesize `backReference`. If a dropped in-window
+  re-add has a non-null `backReference` while its cancelling remove has a null one, fail the
+  checkpoint with an error naming the path and both versions.
+- D8: The window starts at `contentRoot.version`. Log compaction files spanning it must not feed
+  the window; leave a TODO while compaction is disabled (#2337).
+- D9: Pair R13 with a writer-side check that a future manifest commit's
+  `checkpointMetadata.version` exceeds the latest standalone version.
 
 ## Acceptance Criteria
 
@@ -143,11 +176,11 @@ Read side:
   `checkpointMetadata` (version n) and one `contentRoot` equal to the manifest commit's, plus
   protocol, metaData, txn/DM, and the reconciled adds/removes for (R, n]. No new root manifest is
   written.
-- AC2: GIVEN a remove in (R, n] older than the tombstone retention WHEN checkpointing at n THEN
-  the remove is in the file.
-- AC3: GIVEN a txn sidecar whose app ids are untouched after the previous checkpoint WHEN
-  checkpointing THEN the file references that sidecar unchanged. GIVEN one of its app ids is
-  updated THEN the sidecar's entries are inlined and the reference dropped.
+- AC2: GIVEN a remove in (R, n] with a null `deletionTimestamp`, and a remove that cancels an
+  add inside the window, WHEN checkpointing at n THEN both removes are in the file.
+- AC3: GIVEN txn sidecars and no `txn` in the window WHEN checkpointing THEN the file references
+  every txn sidecar unchanged. GIVEN any `txn` in the window THEN all txn sidecar entries are
+  inlined (merged, with expiry applied) and the references dropped.
 - AC4: GIVEN a standalone checkpoint written at n WHEN reading `_last_checkpoint` THEN it names
   version n with `size` and `sizeInBytes`, and has no `amtCheckpoint` or `numOfAddFiles`.
 - AC5: GIVEN an AMT table with no manifest commit WHEN checkpointing THEN a classic V1 checkpoint
@@ -244,12 +277,13 @@ One linear git-stack off `stack/pm_replay_rank_compaction_at_end` (#3651). One P
 ### Phase 1 — write side
 
 - [ ] T1 `feat:` AMT table with no tree writes its enabled checkpoint format (R7, AC5).
-- [ ] T2 `refactor:` tombstone retention becomes a parameter of `ActionReconciliationProcessor`.
+- [ ] T2 `refactor:` tombstone retention becomes an explicit `RemoveRetention` policy of
+  `ActionReconciliationProcessor` (D6).
 - [ ] T3 `refactor:` extract the txn/DM merge from `compute_checkpoint_action` into a shared
   helper.
 - [ ] T4 `feat:` standalone checkpoint schema and `CheckpointAction` -> non-file rows (R1, R2).
-- [ ] T5 `feat:` gap file-action reconciliation for a manifest-commit predecessor (R3, AC2). A
-  standalone predecessor is rejected with a TODO.
+- [ ] T5 `feat:` gap file-action reconciliation over (contentRoot.version, n] for a manifest-commit
+  predecessor (R3, AC2, D5, D7, D8). A standalone predecessor is rejected with a TODO.
 - [ ] T6 `feat:` txn/DM state with sidecar reuse (R4, AC3).
 - [ ] T7 `feat:` wire `CheckpointWriter`: lift the guard, write the hint, capture the
   post-checkpoint action (R1, R5, R6, R8, AC1, AC4, AC6).
