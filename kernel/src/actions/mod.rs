@@ -16,7 +16,6 @@ use visitors::{MetadataVisitor, ProtocolVisitor};
 use self::deletion_vector::DeletionVectorDescriptor;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::amt_path_util::amt_manifest_filemeta;
-#[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::expressions::Scalar;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::expressions::{ArrayData, StructData};
@@ -98,6 +97,29 @@ pub(crate) fn action_presence_leaf(action_name: &str) -> Option<&'static str> {
     }
 }
 
+/// Builds one row of `schema` holding `value` in the top-level field `field_name` and a typed null
+/// in every other field. Lets each action occupy its own row of a single-schema batch.
+pub(crate) fn single_action_row(
+    schema: &StructType,
+    field_name: &str,
+    value: Scalar,
+) -> KernelResult<Vec<Scalar>> {
+    require!(
+        schema.field(field_name).is_some(),
+        KernelError::generic(format!("action field {field_name:?} not found in schema"))
+    );
+    Ok(schema
+        .fields()
+        .map(|field| {
+            if field.name() == field_name {
+                value.clone()
+            } else {
+                Scalar::null(field.data_type().clone())
+            }
+        })
+        .collect())
+}
+
 // === Sub-fields of an AddFile's `stats` struct ===
 // See the Delta protocol spec, "Per-file Statistics", and `expected_stats_schema` in
 // `scan/data_skipping/stats_schema/mod.rs` for the full semantics.
@@ -156,7 +178,7 @@ pub(crate) static CONTENT_ROOT_FIELD: LazyLock<StructField> =
 /// [`Sidecar::to_schema`] here rather than duplicated: `type` cannot be produced by [`ToSchema`]
 /// (which stringifies the Rust identifier, and `r#type` stringifies to `"r#type"`).
 #[cfg(feature = "adaptive-metadata-in-dev")]
-static CONTENT_SIDECAR_FIELD: LazyLock<StructField> = LazyLock::new(|| {
+pub(crate) static CONTENT_SIDECAR_FIELD: LazyLock<StructField> = LazyLock::new(|| {
     StructField::nullable(
         SIDECAR_NAME,
         schema! {
@@ -1427,6 +1449,10 @@ pub(crate) struct ContentRoot {
     /// version). Distinct from [`CheckpointAction::version`], which is
     /// `checkpointMetadata.version`.
     version: i64,
+    /// Optional metadata recorded by the writer about the manifest tree. Copied verbatim.
+    #[allow_null_container_values]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tags: Option<HashMap<String, String>>,
 }
 
 /// Identifies the latest manifest commit up to a given table version.
@@ -1687,22 +1713,7 @@ fn content_sidecar_element(type_str: &str, sidecar: Sidecar) -> KernelResult<Sca
 #[cfg(feature = "adaptive-metadata-in-dev")]
 fn checkpoint_action_union_element(field_name: &str, value: Scalar) -> KernelResult<Scalar> {
     let fields: Vec<StructField> = CHECKPOINT_ACTION_ELEMENT_SCHEMA.fields().cloned().collect();
-    require!(
-        fields.iter().any(|f| f.name() == field_name),
-        KernelError::generic(format!(
-            "checkpoint union element field {field_name:?} not found in element schema"
-        ))
-    );
-    let values = fields
-        .iter()
-        .map(|field| {
-            if field.name() == field_name {
-                value.clone()
-            } else {
-                Scalar::null(field.data_type().clone())
-            }
-        })
-        .collect();
+    let values = single_action_row(&CHECKPOINT_ACTION_ELEMENT_SCHEMA, field_name, value)?;
     Ok(Scalar::Struct(StructData::try_new(fields, values)?))
 }
 
@@ -1749,6 +1760,51 @@ impl CheckpointAction {
         let array_type = ArrayType::new(CHECKPOINT_ACTION_ELEMENT_SCHEMA.clone(), false);
         Ok(Scalar::Array(ArrayData::try_new(array_type, elements)?))
     }
+
+    /// Converts this action into the rows of a standalone checkpoint file: one top-level action per
+    /// row, all in `schema`. The row order matches the embedded `checkpoint` array.
+    #[allow(dead_code)]
+    pub(crate) fn into_standalone_rows(
+        self,
+        engine: &dyn Engine,
+        schema: &SchemaRef,
+    ) -> KernelResult<Box<dyn EngineData>> {
+        self.validate()?;
+        let action_row =
+            |field_name: &str, value: Scalar| single_action_row(schema, field_name, value);
+        let checkpoint_metadata = CheckpointMetadata {
+            version: self.version,
+            tags: None,
+        };
+        let mut rows = vec![
+            action_row(CHECKPOINT_METADATA_NAME, checkpoint_metadata.into())?,
+            action_row(CONTENT_ROOT_NAME, self.content_root.into())?,
+            action_row(PROTOCOL_NAME, self.protocol.into())?,
+            action_row(METADATA_NAME, self.metadata.into())?,
+        ];
+        for txn in self.transactions {
+            rows.push(action_row(SET_TRANSACTION_NAME, txn.into())?);
+        }
+        for dm in self.domain_metadata {
+            rows.push(action_row(DOMAIN_METADATA_NAME, dm.into())?);
+        }
+        let sidecars = self
+            .txn_sidecars
+            .into_iter()
+            .map(|sidecar| (SET_TRANSACTION_NAME, sidecar))
+            .chain(
+                self.domain_metadata_sidecars
+                    .into_iter()
+                    .map(|sidecar| (DOMAIN_METADATA_NAME, sidecar)),
+            );
+        for (type_str, sidecar) in sidecars {
+            let element = content_sidecar_element(type_str, sidecar)?;
+            rows.push(action_row(SIDECAR_NAME, element)?);
+        }
+        engine
+            .evaluation_handler()
+            .create_many(schema.clone(), rows)
+    }
 }
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -1759,6 +1815,7 @@ impl ContentRoot {
             path,
             size_in_bytes,
             version,
+            tags: None,
         }
     }
 }
@@ -2115,6 +2172,8 @@ mod tests {
     };
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
     use crate::arrow::json::ReaderBuilder;
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::checkpoint::STANDALONE_CHECKPOINT_ACTIONS_SCHEMA;
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
     #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -3300,6 +3359,7 @@ mod tests {
                 path: path.to_string(),
                 size_in_bytes,
                 version: 1,
+                tags: None,
             },
             protocol: Protocol::new_unchecked(1, 2, None, None),
             metadata: Metadata::default(),
@@ -3335,6 +3395,7 @@ mod tests {
                 path: "s3://bucket/manifest".to_string(),
                 size_in_bytes: 1024,
                 version: 40,
+                tags: None,
             },
             protocol: Protocol::new_unchecked(1, 2, None, None),
             metadata: Metadata::default(),
@@ -3354,10 +3415,15 @@ mod tests {
     }
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[test]
-    fn test_checkpoint_action_scalar_round_trip() -> KernelResult<()> {
+    #[rstest]
+    #[case::no_content_root_tags(None)]
+    #[case::content_root_tags(Some(HashMap::from([("tag".to_string(), "value".to_string())])))]
+    fn test_checkpoint_action_scalar_round_trip(
+        #[case] content_root_tags: Option<HashMap<String, String>>,
+    ) -> KernelResult<()> {
         let engine = ExprEngine::new();
-        let action = sample_checkpoint_action();
+        let mut action = sample_checkpoint_action();
+        action.content_root.tags = content_root_tags;
         let scalar = action.clone().try_into_scalar()?;
         let data = create_row(&engine, LOG_CHECKPOINT_SCHEMA.clone(), scalar)?;
         let back = CheckpointAction::try_new_from_data(data.as_ref())?
@@ -3422,6 +3488,71 @@ mod tests {
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
+    fn test_checkpoint_action_into_standalone_rows_holds_one_action_per_row() -> KernelResult<()> {
+        let engine = ExprEngine::new();
+        let mut action = sample_checkpoint_action();
+        action.content_root.tags = Some(HashMap::from([("tag".to_string(), "value".to_string())]));
+        action.transactions.push(SetTransaction {
+            app_id: "otherApp".to_string(),
+            version: 9,
+            last_updated: None,
+        });
+        action.domain_metadata.push(DomainMetadata {
+            domain: "delta.clustering".to_string(),
+            configuration: "{}".to_string(),
+            removed: false,
+        });
+
+        let rows = action.into_standalone_rows(&engine, &STANDALONE_CHECKPOINT_ACTIONS_SCHEMA)?;
+        let bytes = to_json_bytes(std::iter::once(Ok(
+            FilteredEngineData::with_all_rows_selected(rows),
+        )))?;
+        let rows: Vec<serde_json::Value> = bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+
+        // The JSON writer omits null columns, so a row with one non-null action is an object
+        // with exactly one key.
+        for row in &rows {
+            assert_eq!(
+                row.as_object().unwrap().len(),
+                1,
+                "row {row} holds one action"
+            );
+        }
+        assert_eq!(
+            rows,
+            vec![
+                json!({ "checkpointMetadata": { "version": 42 } }),
+                json!({ "contentRoot": {
+                    "path": "s3://bucket/manifest",
+                    "sizeInBytes": 1024,
+                    "version": 40,
+                    "tags": { "tag": "value" },
+                } }),
+                json!({ "protocol": { "minReaderVersion": 1, "minWriterVersion": 2 } }),
+                json!({ "metaData": {
+                    "id": "",
+                    "format": { "provider": "parquet", "options": {} },
+                    "schemaString": "",
+                    "partitionColumns": [],
+                    "configuration": {},
+                } }),
+                json!({ "txn": { "appId": "myApp", "version": 3 } }),
+                json!({ "txn": { "appId": "otherApp", "version": 9 } }),
+                json!({ "domainMetadata": { "domain": "myDomain", "configuration": "cfg", "removed": false } }),
+                json!({ "domainMetadata": { "domain": "delta.clustering", "configuration": "{}", "removed": false } }),
+                json!({ "sidecar": { "type": "txn", "path": "txn-sidecar.parquet", "sizeInBytes": 100, "modificationTime": 1, "tags": { "tag": "value" } } }),
+                json!({ "sidecar": { "type": "domainMetadata", "path": "dm-sidecar.parquet", "sizeInBytes": 100, "modificationTime": 1, "tags": { "tag": "value" } } }),
+            ]
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
     fn test_try_new_from_data_returns_none_when_no_checkpoint_action() -> KernelResult<()> {
         // `action_batch` carries many action kinds but no `checkpoint` array, so parsing yields
         // `Ok(None)` rather than an error.
@@ -3447,6 +3578,7 @@ mod tests {
                 path: "s3://bucket/manifest".to_string(),
                 size_in_bytes: 8,
                 version: 8,
+                tags: None,
             },
             protocol: Protocol::new_unchecked(1, 2, None, None),
             metadata: Metadata::default(),

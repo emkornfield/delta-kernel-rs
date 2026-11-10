@@ -1062,6 +1062,7 @@ fn visit_content_root_at<'a>(
         path,
         size_in_bytes: getters[1].get(row_index, "contentRoot.sizeInBytes")?,
         version: getters[2].get(row_index, "contentRoot.version")?,
+        tags: getters[3].get_opt(row_index, "contentRoot.tags")?,
     }))
 }
 
@@ -1262,6 +1263,7 @@ mod tests {
                 path: "s3://bucket/manifest".to_string(),
                 size_in_bytes: 512,
                 version: 5,
+                tags: None,
             },
             protocol: Protocol::new_unchecked(1, 2, None, None),
             metadata: Metadata::default(),

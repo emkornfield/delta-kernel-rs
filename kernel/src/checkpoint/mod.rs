@@ -123,8 +123,10 @@ use crate::action_reconciliation::{
 use crate::actions::{
     ADD_FIELD, CHECKPOINT_METADATA_FIELD, CHECKPOINT_METADATA_NAME, CheckpointMetadata,
     DOMAIN_METADATA_FIELD, METADATA_FIELD, PROTOCOL_FIELD, REMOVE_FIELD, SET_TRANSACTION_FIELD,
-    SIDECAR_FIELD,
+    SIDECAR_FIELD, single_action_row,
 };
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::actions::{CONTENT_ROOT_FIELD, CONTENT_SIDECAR_FIELD};
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::Scalar;
 use crate::last_checkpoint_hint::LastCheckpointHint;
@@ -312,8 +314,8 @@ static LAST_CHECKPOINT_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     nullable "numOfAddFiles": LONG,
 };
 
-/// Action fields shared by V1 and V2 checkpoint schemas.
-fn base_checkpoint_action_fields() -> [&'static LazyLock<StructField>; 7] {
+/// Action fields shared by V1, V2, and standalone AMT checkpoint schemas.
+fn base_checkpoint_action_fields() -> [&'static LazyLock<StructField>; 6] {
     [
         &ADD_FIELD,
         &REMOVE_FIELD,
@@ -321,19 +323,33 @@ fn base_checkpoint_action_fields() -> [&'static LazyLock<StructField>; 7] {
         &PROTOCOL_FIELD,
         &SET_TRANSACTION_FIELD,
         &DOMAIN_METADATA_FIELD,
-        &SIDECAR_FIELD,
     ]
 }
 
 /// Schema for V1 checkpoints (without checkpointMetadata action)
-static CHECKPOINT_ACTIONS_SCHEMA_V1: LazyLock<SchemaRef> =
-    lazy_schema_ref! { ..(base_checkpoint_action_fields()) };
+static CHECKPOINT_ACTIONS_SCHEMA_V1: LazyLock<SchemaRef> = lazy_schema_ref! {
+    ..(base_checkpoint_action_fields()),
+    (&SIDECAR_FIELD),
+};
 
 /// Schema for V2 checkpoints (includes checkpointMetadata action). JSON checkpoints do not embed
 /// a schema, so readers assume this schema for them.
 pub(crate) static CHECKPOINT_ACTIONS_SCHEMA_V2: LazyLock<SchemaRef> = lazy_schema_ref! {
     ..(base_checkpoint_action_fields()),
+    (&SIDECAR_FIELD),
     (&CHECKPOINT_METADATA_FIELD),
+};
+
+/// Schema for standalone adaptiveMetadata checkpoints, where each row holds one top-level action.
+/// Its `sidecar` column carries typed AMT sidecars, so it is the AMT element, not the V2
+/// file-action `sidecar` that the V1 and V2 schemas use.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[allow(dead_code)]
+pub(crate) static STANDALONE_CHECKPOINT_ACTIONS_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    ..(base_checkpoint_action_fields()),
+    (&CHECKPOINT_METADATA_FIELD),
+    (&CONTENT_ROOT_FIELD),
+    (&CONTENT_SIDECAR_FIELD),
 };
 
 /// Orchestrates the process of creating a checkpoint for a table.
@@ -737,17 +753,7 @@ impl CheckpointWriter {
         }
         .into();
 
-        // Build an action row with only the checkpointMetadata field set; all others null.
-        let row: Vec<Scalar> = schema
-            .fields()
-            .map(|field| {
-                if field.name() == CHECKPOINT_METADATA_NAME {
-                    checkpoint_metadata_value.clone()
-                } else {
-                    Scalar::null(field.data_type().clone())
-                }
-            })
-            .collect();
+        let row = single_action_row(schema, CHECKPOINT_METADATA_NAME, checkpoint_metadata_value)?;
         let checkpoint_metadata_batch = engine
             .evaluation_handler()
             .create_many(schema.clone(), vec![row])?;

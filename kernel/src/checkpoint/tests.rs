@@ -13,6 +13,11 @@ use crate::action_reconciliation::{
     ActionReconciliationIterator, ActionReconciliationIteratorState, DEFAULT_RETENTION_SECS,
     deleted_file_retention_timestamp_with_time,
 };
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::actions::{
+    ADD_NAME, CHECKPOINT_METADATA_NAME, CONTENT_ROOT_NAME, DOMAIN_METADATA_NAME, METADATA_NAME,
+    PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME, SIDECAR_NAME,
+};
 use crate::actions::{Add, Metadata, Protocol, Remove};
 use crate::arrow::array::{
     Array, AsArray, Int64Array, MapArray, RecordBatch, StructArray, create_array,
@@ -23,7 +28,7 @@ use crate::checkpoint::{
     create_last_checkpoint_data,
 };
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::checkpoint::{CheckpointSpec, V2CheckpointConfig};
+use crate::checkpoint::{CheckpointSpec, STANDALONE_CHECKPOINT_ACTIONS_SCHEMA, V2CheckpointConfig};
 use crate::committer::FileSystemCommitter;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use crate::engine::sync::SyncEngine;
@@ -31,6 +36,8 @@ use crate::log_replay::HasSelectionVector;
 use crate::object_store::ObjectStoreExt as _;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::schema::StructType;
 use crate::schema::{DataType as KernelDataType, StructField, schema_ref};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::snapshot::{CheckpointWriteResult, SnapshotRef};
@@ -1518,4 +1525,47 @@ async fn test_checkpoint_with_varchar_metadata_on_field() -> Result<()> {
         .checkpoint(&engine, None)?;
 
     Ok(())
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn nested_struct<'a>(schema: &'a StructType, name: &str) -> &'a StructType {
+    match schema.field(name).unwrap().data_type() {
+        KernelDataType::Struct(inner) => inner,
+        other => panic!("Expected struct for {name}, got {other:?}"),
+    }
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[test]
+fn test_standalone_checkpoint_schema_top_level_fields() {
+    let schema = &*STANDALONE_CHECKPOINT_ACTIONS_SCHEMA;
+    let field_names: Vec<&str> = schema.fields().map(|f| f.name.as_str()).collect();
+    assert_eq!(
+        field_names,
+        vec![
+            ADD_NAME,
+            REMOVE_NAME,
+            METADATA_NAME,
+            PROTOCOL_NAME,
+            SET_TRANSACTION_NAME,
+            DOMAIN_METADATA_NAME,
+            CHECKPOINT_METADATA_NAME,
+            CONTENT_ROOT_NAME,
+            SIDECAR_NAME,
+        ]
+    );
+
+    // The typed AMT sidecar is discriminated by `type`; the V2 file-action sidecar has no such
+    // column.
+    assert!(nested_struct(schema, SIDECAR_NAME).field("type").is_some());
+
+    // Standalone file actions keep their stats and carry the AMT back reference.
+    for name in [ADD_NAME, REMOVE_NAME] {
+        let action = nested_struct(schema, name);
+        assert!(action.field("stats").is_some(), "{name} should keep stats");
+        assert!(
+            action.field("backReference").is_some(),
+            "{name} should carry backReference"
+        );
+    }
 }
