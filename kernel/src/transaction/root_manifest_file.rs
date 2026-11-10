@@ -1,9 +1,8 @@
 //! Commits a caller-supplied root manifest file as the table's content root.
 
-use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
+use crate::action_reconciliation::merge_txns_and_domain_metadata;
 use crate::actions::visitors::SetTransactionMap;
 use crate::actions::{CheckpointAction, ContentRoot, DomainMetadata, SetTransaction};
-use crate::crc::merge_domain_metadata;
 use crate::error::KernelError;
 use crate::log_segment::DomainMetadataMap;
 use crate::snapshot::SnapshotRef;
@@ -39,26 +38,14 @@ impl RootManifestFile {
         dm_changes: &[DomainMetadata],
         set_transactions: &[SetTransaction],
     ) -> KernelResult<CheckpointAction> {
-        let (mut domain_metadata, mut transactions) = self.scan_non_content_metadata(engine)?;
-
-        // Domains can be tombstoned, so merging applies removals. The transactions map is keyed by
-        // app id, so extend overwrites with the newest entry per app.
-        merge_domain_metadata(
-            &mut domain_metadata,
-            dm_changes
-                .iter()
-                .cloned()
-                .map(|dm| (dm.domain().to_string(), dm)),
-        );
-        transactions.extend(
-            set_transactions
-                .iter()
-                .cloned()
-                .map(|txn| (txn.app_id.clone(), txn)),
-        );
-        let expiration_timestamp =
-            calculate_transaction_expiration_timestamp(table_config.table_properties())?;
-        transactions.retain(|_, txn| !txn.is_expired(expiration_timestamp));
+        let (base_domain_metadata, base_transactions) = self.scan_non_content_metadata(engine)?;
+        let (domain_metadata, transactions) = merge_txns_and_domain_metadata(
+            base_domain_metadata,
+            base_transactions,
+            dm_changes.iter().cloned(),
+            set_transactions.iter().cloned(),
+            table_config.table_properties(),
+        )?;
 
         let version = version_as_i64(commit_version)?;
         let size = i64::try_from(self.file.size)
