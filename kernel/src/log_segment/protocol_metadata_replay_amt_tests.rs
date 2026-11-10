@@ -1562,61 +1562,41 @@ async fn segment_with_compaction(
     log_segment
 }
 
-// A log compaction holds the P&M in effect at its last version, so non-plan replay ranks it there.
-// Each case leaves Protocol or Metadata only in the newest commit's lagging checkpoint action,
-// whose version falls inside the compaction. A compaction holding a later Metadata change beats
-// that action's older Metadata, while one without Metadata leaves the action's Metadata in place.
-#[rstest]
-#[case::later_metadata_in_compaction_wins(
-    metadata_commit(one_column_schema()),
-    metadata_commit(test_schema_flat_with_column_mapping()),
-    test_schema_flat_with_column_mapping()
-)]
-#[case::compaction_without_metadata_keeps_pointed_metadata(
-    protocol_commit(1, 2),
-    txn_commit(),
-    one_column_schema()
-)]
+// A log compaction holds the P&M in effect at its last version, so replay ranks it there. A
+// checkpoint file bounds this replay, so it reads the whole cover: the compaction of v1..=3 holds
+// v3's Metadata and spans v2, where the newest commit's checkpoint action lags. Ranked at its start
+// version, the compaction would lose to the action's older nested Metadata.
 #[tokio::test]
-async fn non_plan_replay_ranks_compaction_at_its_last_version(
-    #[case] first_commit: String,
-    #[case] compacted_commit: String,
-    #[case] expected_schema: SchemaRef,
-) {
-    let commits = [
-        first_commit,
-        txn_commit(),
-        txn_commit(),
-        compacted_commit.clone(),
-        carrying_pointer((4, 2), checkpoint_action(2, &[], one_column_schema())),
-    ];
-    assert_compaction_ranked(
-        &commits,
-        &compacted_commit,
-        &expected_schema,
-        non_plan_engine,
-    )
-    .await;
+async fn bounded_replay_ranks_compaction_at_its_last_version() {
+    check_compaction_ranked_at_last_version(non_plan_engine).await;
+    #[cfg(feature = "declarative-plans")]
+    check_compaction_ranked_at_last_version(|store| SyncEngine::new_with_store(store)).await;
 }
 
-// Writes `commits` as versions 0.., compacts versions 1..=3 into `compaction`, and asserts the
-// replayed Metadata has `expected_schema`.
-async fn assert_compaction_ranked<E: Engine>(
-    commits: &[String],
-    compaction: &str,
-    expected_schema: &SchemaRef,
+async fn check_compaction_ranked_at_last_version<E: Engine>(
     make_engine: impl FnOnce(Arc<InMemory>) -> E,
 ) {
-    let (store, table_root) = commit_table(commits).await;
+    let newer_metadata = metadata_commit(test_schema_flat_with_column_mapping());
+    let (store, table_root) = commit_table(&[
+        protocol_and_metadata_lines(one_column_schema(), &[]),
+        txn_commit(),
+        txn_commit(),
+        newer_metadata.clone(),
+        carrying_pointer((4, 2), checkpoint_action(2, &[], one_column_schema())),
+    ])
+    .await;
+    put_pm_checkpoint(&store, 0).await;
+    let compaction = [txn_commit(), txn_commit(), newer_metadata].join("\n");
     let engine = make_engine(store.clone());
     let log_segment =
-        segment_with_compaction(&store, &table_root, &engine, (1, 3), compaction).await;
+        segment_with_compaction(&store, &table_root, &engine, (1, 3), &compaction).await;
+    assert_eq!(log_segment.checkpoint_version, Some(0));
 
     let resolution = log_segment
         .read_protocol_metadata_opt(&engine, None)
         .unwrap();
     let schema = resolution.metadata.unwrap().parse_schema().unwrap();
-    assert_eq!(&schema, expected_schema.as_ref());
+    assert_eq!(schema, *test_schema_flat_with_column_mapping());
 }
 
 // Replay reads the pointed manifest commit as its own file even when a compaction covers it, and
