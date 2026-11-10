@@ -869,9 +869,10 @@ impl RowVisitor for CheckpointVisitor {
     }
 }
 
-/// Getter sub-ranges within the flattened element-union schema, one per element variant. The
-/// element schema concatenates each variant's leaves in a fixed order, so a variant's leaves are
-/// always a contiguous slice of the getters.
+/// Getter sub-ranges within a flattened checkpoint-element schema, one per element variant. Each
+/// variant's leaves are a contiguous slice of the getters, so a schema whose fields are the
+/// variants can be probed the same way whether it is the `checkpoint` array's element or a
+/// standalone file's top-level row.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[derive(Default)]
 struct CheckpointElementRanges {
@@ -888,50 +889,56 @@ struct CheckpointElementRanges {
 }
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
-static CHECKPOINT_ELEMENT_RANGES: LazyLock<CheckpointElementRanges> = LazyLock::new(|| {
-    // Walk CHECKPOINT_ACTION_ELEMENT_SCHEMA itself, sizing each range by that field's leaf count,
-    // so the ranges cannot drift from the schema they index into.
-    let mut r = CheckpointElementRanges::default();
-    let mut next = 0;
-    for field in CHECKPOINT_ACTION_ELEMENT_SCHEMA.fields() {
-        let leaf_count = match field.data_type() {
-            DataType::Struct(inner) => inner.leaves(None).as_ref().0.len(),
-            _ => 0,
-        };
-        let range = next..next + leaf_count;
-        next += leaf_count;
-        match field.name().as_str() {
-            CHECKPOINT_METADATA_NAME => r.checkpoint_metadata = range,
-            CONTENT_ROOT_NAME => r.content_root = range,
-            PROTOCOL_NAME => r.protocol = range,
-            METADATA_NAME => r.metadata = range,
-            DOMAIN_METADATA_NAME => r.domain_metadata = range,
-            SET_TRANSACTION_NAME => r.txn = range,
-            // The sidecar element is a leading `type` leaf followed by the Sidecar leaves.
-            SIDECAR_NAME => {
-                r.sidecar_type = range.start;
-                r.sidecar = (range.start + 1)..range.end;
+impl CheckpointElementRanges {
+    /// Computes the ranges for `schema`, whose fields are the element variants. Each field's range
+    /// is sized by its leaf count, so the ranges cannot drift from the schema they index into.
+    fn from_schema(schema: &StructType) -> Self {
+        let mut r = Self::default();
+        let mut next = 0;
+        for field in schema.fields() {
+            let leaf_count = match field.data_type() {
+                DataType::Struct(inner) => inner.leaves(None).as_ref().0.len(),
+                _ => 0,
+            };
+            let range = next..next + leaf_count;
+            next += leaf_count;
+            match field.name().as_str() {
+                CHECKPOINT_METADATA_NAME => r.checkpoint_metadata = range,
+                CONTENT_ROOT_NAME => r.content_root = range,
+                PROTOCOL_NAME => r.protocol = range,
+                METADATA_NAME => r.metadata = range,
+                DOMAIN_METADATA_NAME => r.domain_metadata = range,
+                SET_TRANSACTION_NAME => r.txn = range,
+                // The sidecar element is a leading `type` leaf followed by the Sidecar leaves.
+                SIDECAR_NAME => {
+                    r.sidecar_type = range.start;
+                    r.sidecar = (range.start + 1)..range.end;
+                }
+                _ => {}
             }
-            _ => {}
         }
+        // Every checkpoint element field is a struct with >= 1 leaf, so every range must have been
+        // populated by the match above. A 0..0 range means a name in the match drifted from the
+        // schema and would silently alias field 0's getter.
+        debug_assert!(
+            !r.checkpoint_metadata.is_empty()
+                && !r.content_root.is_empty()
+                && !r.protocol.is_empty()
+                && !r.metadata.is_empty()
+                && !r.domain_metadata.is_empty()
+                && !r.txn.is_empty()
+                && r.sidecar_type > 0
+                && !r.sidecar.is_empty(),
+            "CheckpointElementRanges: a checkpoint element field name did not match a known \
+             variant (schema/constant drift)"
+        );
+        r
     }
-    // Every checkpoint element field is a struct with >= 1 leaf, so every range must have been
-    // populated by the match above. A 0..0 range means a name in the match drifted from
-    // CHECKPOINT_ACTION_ELEMENT_SCHEMA and would silently alias field 0's getter.
-    debug_assert!(
-        !r.checkpoint_metadata.is_empty()
-            && !r.content_root.is_empty()
-            && !r.protocol.is_empty()
-            && !r.metadata.is_empty()
-            && !r.domain_metadata.is_empty()
-            && !r.txn.is_empty()
-            && r.sidecar_type > 0
-            && !r.sidecar.is_empty(),
-        "CHECKPOINT_ELEMENT_RANGES: a checkpoint element field name did not match a known variant \
-         (schema/constant drift)"
-    );
-    r
-});
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+static CHECKPOINT_ELEMENT_RANGES: LazyLock<CheckpointElementRanges> =
+    LazyLock::new(|| CheckpointElementRanges::from_schema(&CHECKPOINT_ACTION_ELEMENT_SCHEMA));
 
 /// Inner visitor over the element structs of a `checkpoint` array, collecting each element into
 /// the field it belongs to. Sidecars are split into `txn` vs `domainMetadata` by their `type`.
@@ -974,6 +981,62 @@ impl CheckpointElementVisitor {
         action.validate()?;
         Ok(action)
     }
+
+    /// Parses the element at `row_index` into the field it belongs to. `getters` must be the
+    /// leaves of the schema that `r` was computed from.
+    fn visit_element_at<'a>(
+        &mut self,
+        row_index: usize,
+        getters: &[&'a dyn GetData<'a>],
+        r: &CheckpointElementRanges,
+    ) -> KernelResult<()> {
+        // Each element is a single-key tagged object, so at most one variant has a non-null
+        // required leaf. Probe each variant's required leaf in turn to identify it. An element
+        // matching none of them is a variant added by a newer writer; skip it for forward
+        // compatibility rather than failing the whole action.
+        if let Some(version) =
+            getters[r.checkpoint_metadata.start].get_opt(row_index, "checkpointMetadata.version")?
+        {
+            set_once(&mut self.version, version, "checkpointMetadata")?;
+        } else if let Some(content_root) =
+            visit_content_root_at(row_index, &getters[r.content_root.clone()])?
+        {
+            set_once(&mut self.content_root, content_root, "contentRoot")?;
+        } else if let Some(protocol) = visit_protocol_at(row_index, &getters[r.protocol.clone()])? {
+            set_once(&mut self.protocol, protocol, "protocol")?;
+        } else if let Some(metadata) = visit_metadata_at(row_index, &getters[r.metadata.clone()])? {
+            set_once(&mut self.metadata, metadata, "metaData")?;
+        } else if let Some(domain) =
+            getters[r.domain_metadata.start].get_opt(row_index, "domainMetadata.domain")?
+        {
+            self.domain_metadata
+                .push(DomainMetadataVisitor::visit_domain_metadata(
+                    row_index,
+                    domain,
+                    &getters[r.domain_metadata.clone()],
+                )?);
+        } else if let Some(app_id) = getters[r.txn.start].get_opt(row_index, "txn.appId")? {
+            self.transactions.push(SetTransactionVisitor::visit_txn(
+                row_index,
+                app_id,
+                &getters[r.txn.clone()],
+            )?);
+        } else if let Some(path) = getters[r.sidecar.start].get_opt(row_index, "sidecar.path")? {
+            let sidecar =
+                SidecarVisitor::visit_sidecar(row_index, path, &getters[r.sidecar.clone()])?;
+            let sidecar_type: String = getters[r.sidecar_type].get(row_index, "sidecar.type")?;
+            match sidecar_type.as_str() {
+                SET_TRANSACTION_NAME => self.txn_sidecars.push(sidecar),
+                DOMAIN_METADATA_NAME => self.domain_metadata_sidecars.push(sidecar),
+                other => {
+                    return Err(KernelError::generic(format!(
+                        "checkpoint sidecar has unsupported type `{other}`"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -985,52 +1048,8 @@ impl RowVisitor for CheckpointElementVisitor {
     }
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
-        let r = &*CHECKPOINT_ELEMENT_RANGES;
         for i in 0..row_count {
-            // Each element is a single-key tagged object, so at most one variant has a non-null
-            // required leaf. Probe each variant's required leaf in turn to identify it. An element
-            // matching none of them is a variant added by a newer writer; skip it for forward
-            // compatibility rather than failing the whole action.
-            if let Some(version) =
-                getters[r.checkpoint_metadata.start].get_opt(i, "checkpointMetadata.version")?
-            {
-                set_once(&mut self.version, version, "checkpointMetadata")?;
-            } else if let Some(content_root) =
-                visit_content_root_at(i, &getters[r.content_root.clone()])?
-            {
-                set_once(&mut self.content_root, content_root, "contentRoot")?;
-            } else if let Some(protocol) = visit_protocol_at(i, &getters[r.protocol.clone()])? {
-                set_once(&mut self.protocol, protocol, "protocol")?;
-            } else if let Some(metadata) = visit_metadata_at(i, &getters[r.metadata.clone()])? {
-                set_once(&mut self.metadata, metadata, "metaData")?;
-            } else if let Some(domain) =
-                getters[r.domain_metadata.start].get_opt(i, "domainMetadata.domain")?
-            {
-                self.domain_metadata
-                    .push(DomainMetadataVisitor::visit_domain_metadata(
-                        i,
-                        domain,
-                        &getters[r.domain_metadata.clone()],
-                    )?);
-            } else if let Some(app_id) = getters[r.txn.start].get_opt(i, "txn.appId")? {
-                self.transactions.push(SetTransactionVisitor::visit_txn(
-                    i,
-                    app_id,
-                    &getters[r.txn.clone()],
-                )?);
-            } else if let Some(path) = getters[r.sidecar.start].get_opt(i, "sidecar.path")? {
-                let sidecar = SidecarVisitor::visit_sidecar(i, path, &getters[r.sidecar.clone()])?;
-                let sidecar_type: String = getters[r.sidecar_type].get(i, "sidecar.type")?;
-                match sidecar_type.as_str() {
-                    SET_TRANSACTION_NAME => self.txn_sidecars.push(sidecar),
-                    DOMAIN_METADATA_NAME => self.domain_metadata_sidecars.push(sidecar),
-                    other => {
-                        return Err(KernelError::generic(format!(
-                            "checkpoint sidecar has unsupported type `{other}`"
-                        )));
-                    }
-                }
-            }
+            self.visit_element_at(i, getters, &CHECKPOINT_ELEMENT_RANGES)?;
         }
         Ok(())
     }
