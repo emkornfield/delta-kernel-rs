@@ -32,10 +32,16 @@ use crate::object_store::ObjectStoreExt as _;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path;
 use crate::schema::{DataType as KernelDataType, StructField, schema_ref};
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::snapshot::{CheckpointWriteResult, SnapshotRef};
 use crate::table_features::TableFeature;
 use crate::transaction::UpdateTableOperation;
 use crate::transaction::create_table::create_table;
 use crate::unit_test_utils::Action;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::unit_test_utils::adaptive_metadata_fixtures::{
+    minimal_checkpoint_action, setup_table, write_manifest_commit,
+};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::unit_test_utils::{
     adaptive_metadata_table_configuration, test_schema_flat_with_column_mapping,
@@ -717,16 +723,7 @@ async fn test_no_checkpoint_on_unpublished_snapshot() -> Result<()> {
 }
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
-#[rstest::rstest]
-#[tokio::test]
-async fn test_no_standalone_checkpoint_on_adaptive_metadata_table(
-    #[values(
-        None,
-        Some(CheckpointSpec::V1),
-        Some(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar))
-    )]
-    spec: Option<CheckpointSpec>,
-) -> Result<()> {
+async fn adaptive_metadata_table_without_tree() -> Result<(SyncEngine, SnapshotRef)> {
     let (store, _) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
     let config = adaptive_metadata_table_configuration(test_schema_flat_with_column_mapping(), &[]);
@@ -740,10 +737,56 @@ async fn test_no_standalone_checkpoint_on_adaptive_metadata_table(
     add_commit("memory:///", store.as_ref(), 0, commit)
         .await
         .unwrap();
-
     let snapshot = Snapshot::builder_for("memory:///").build(&engine)?;
-    let message =
-        "Standalone checkpoints are not yet supported for tables with adaptiveMetadata enabled";
+    Ok((engine, snapshot))
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[rstest::rstest]
+#[tokio::test]
+async fn test_adaptive_metadata_table_without_tree_writes_enabled_checkpoint_format(
+    #[values(None, Some(CheckpointSpec::V1))] spec: Option<CheckpointSpec>,
+) -> Result<()> {
+    let (engine, snapshot) = adaptive_metadata_table_without_tree().await?;
+
+    let (result, checkpointed) = snapshot.checkpoint(&engine, spec.as_ref())?;
+
+    assert_eq!(result, CheckpointWriteResult::Written);
+    assert_eq!(checkpointed.log_segment().checkpoint_version, Some(0));
+    let reloaded = Snapshot::builder_for("memory:///").build(&engine)?;
+    assert_eq!(reloaded.log_segment().checkpoint_version, Some(0));
+    assert_eq!(reloaded.latest_checkpoint_action(&engine)?, None);
+    Ok(())
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[tokio::test]
+async fn test_adaptive_metadata_table_without_tree_rejects_v2_checkpoint() -> Result<()> {
+    let (engine, snapshot) = adaptive_metadata_table_without_tree().await?;
+    let spec = CheckpointSpec::V2(V2CheckpointConfig::NoSidecar);
+    assert_result_error_with_message(
+        snapshot.checkpoint(&engine, Some(&spec)),
+        "CheckpointSpec::V2 requires the v2Checkpoint table feature to be supported",
+    );
+    Ok(())
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[rstest::rstest]
+fn test_no_standalone_checkpoint_on_adaptive_metadata_table_with_tree(
+    #[values(None, Some(CheckpointSpec::V1))] spec: Option<CheckpointSpec>,
+) -> Result<()> {
+    let (engine, table_root) = setup_table()?;
+    write_manifest_commit(
+        &engine,
+        &table_root,
+        1,
+        minimal_checkpoint_action("metadata/root.parquet", 1)?,
+    )?;
+
+    let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+    let message = "Standalone checkpoints are not yet supported for tables with an \
+                   adaptiveMetadata tree (latest checkpoint action at version 1)";
     assert_result_error_with_message(snapshot.checkpoint(&engine, spec.as_ref()), message);
     assert_result_error_with_message(snapshot.create_checkpoint_writer(&engine), message);
     Ok(())

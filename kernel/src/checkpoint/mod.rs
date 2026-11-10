@@ -131,8 +131,7 @@ use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_replay::HasSelectionVector;
 use crate::path::{self, ParsedLogPath};
 use crate::schema::{SchemaRef, StructField, lazy_schema_ref};
-use crate::snapshot::SnapshotRef;
-use crate::table_configuration::TableConfiguration;
+use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
 use crate::{
@@ -376,7 +375,7 @@ impl CheckpointWriter {
             .table_configuration()
             .ensure_read_write_supported()?;
 
-        ensure_standalone_checkpoint_supported(snapshot.table_configuration())?;
+        ensure_checkpoint_supported(&snapshot, engine)?;
 
         // We disallow checkpointing if the Snapshot is not published. If we didn't, this could
         // create gaps in the version history, thereby breaking old readers.
@@ -783,18 +782,25 @@ impl CheckpointWriter {
     }
 }
 
-/// Returns an error if Kernel does not support writing standalone (V1/V2) checkpoints for the
-/// table.
+/// Returns an error if Kernel does not support writing a checkpoint for the snapshot. An
+/// adaptiveMetadata table without a metadata tree gets the checkpoint format its features enable;
+/// one with a tree is not yet supported.
 #[cfg_attr(not(feature = "adaptive-metadata-in-dev"), allow(unused_variables))]
-pub(crate) fn ensure_standalone_checkpoint_supported(
-    table_configuration: &TableConfiguration,
+pub(crate) fn ensure_checkpoint_supported(
+    snapshot: &Snapshot,
+    engine: &dyn Engine,
 ) -> KernelResult<()> {
-    // TODO(#3683): support standalone checkpoints for adaptiveMetadata tables.
+    // Without a metadata tree there is no content root to reference, so a classic checkpoint is
+    // the only way to bound replay. The RFC forbids classic checkpoints once adaptiveMetadata is
+    // enabled; TODO: amend it to allow them until the first manifest commit.
+    // TODO(#3683): write standalone checkpoints for adaptiveMetadata tables with a metadata tree.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    if table_configuration.is_feature_enabled(&TableFeature::AdaptiveMetadataPreview) {
-        return Err(KernelError::unsupported(
-            "Standalone checkpoints are not yet supported for tables with adaptiveMetadata enabled",
-        ));
+    if let Some(action) = snapshot.latest_checkpoint_action(engine)? {
+        return Err(KernelError::unsupported(format!(
+            "Standalone checkpoints are not yet supported for tables with an adaptiveMetadata \
+             tree (latest checkpoint action at version {})",
+            action.version
+        )));
     }
     Ok(())
 }
