@@ -131,6 +131,24 @@ pub(crate) struct ActionsWithCheckpointInfo<A: KernelResultIterator<ActionsBatch
     pub checkpoint_info: CheckpointReadInfo,
 }
 
+/// Where an adaptiveMetadata `checkpoint` action is read from. The source selects the guards
+/// that [`LogSegment::read_actions_with_checkpoint_action`] applies to the action.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+pub(crate) enum CheckpointActionSource {
+    /// The manifest commit that `pointer` names, which carries the action.
+    ManifestCommit {
+        pointer: LastManifestCommit,
+        /// The version of the listed standalone checkpoint that this commit supersedes, if any.
+        superseded_standalone: Option<i64>,
+    },
+    /// The listed standalone checkpoint file. `pointer` is the `lastManifestCommit` checked
+    /// against the file, or `None` when the snapshot cannot read it.
+    Standalone {
+        file: ParsedLogPath<FileMeta>,
+        pointer: Option<LastManifestCommit>,
+    },
+}
+
 /// A [`LogSegment`] represents a contiguous section of the log and is made of checkpoint files
 /// and commit files and guarantees the following:
 ///     1. Commit file versions will not have any gaps between them.
@@ -986,6 +1004,7 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
         checkpoint: &CheckpointAction,
+        source: &CheckpointActionSource,
         table_root: &Url,
         commit_read_schema: SchemaRef,
         checkpoint_read_schema: SchemaRef,
@@ -1011,13 +1030,26 @@ impl LogSegment {
                 checkpoint.content_root_version()
             ))
         );
-        // Writers stop producing checkpoint files once adaptiveMetadata is enabled, so a file at or
-        // after the action's version is a standalone checkpoint.
-        if let Some(checkpoint_file_version) = self.checkpoint_version.filter(|v| *v >= version) {
-            return Err(KernelError::unsupported(format!(
-                "reading the adaptiveMetadata standalone checkpoint at version \
-                 {checkpoint_file_version} is not yet supported"
-            )));
+        match source {
+            CheckpointActionSource::ManifestCommit { .. } => {
+                // Writers stop producing checkpoint files once adaptiveMetadata is enabled, so a
+                // file at or after the action's version is a standalone checkpoint.
+                if let Some(checkpoint_file_version) =
+                    self.checkpoint_version.filter(|v| *v >= version)
+                {
+                    return Err(KernelError::unsupported(format!(
+                        "reading the adaptiveMetadata standalone checkpoint at version \
+                         {checkpoint_file_version} is not yet supported"
+                    )));
+                }
+            }
+            CheckpointActionSource::Standalone { file, .. } => {
+                return Err(KernelError::unsupported(format!(
+                    "reading the adaptiveMetadata standalone checkpoint at version {} is not yet \
+                     supported",
+                    file.version
+                )));
+            }
         }
 
         let commits = Self::read_commit_files(

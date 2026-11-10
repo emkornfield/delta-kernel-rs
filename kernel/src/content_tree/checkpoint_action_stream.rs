@@ -178,8 +178,8 @@ mod tests {
 
     use super::*;
     use crate::actions::{
-        ADD_SCHEMA, Add, COMMIT_INFO_NAME, ContentRoot, DomainMetadata, Metadata, Protocol,
-        REMOVE_FIELD, SetTransaction, get_commit_schema,
+        ADD_SCHEMA, Add, COMMIT_INFO_NAME, ContentRoot, DomainMetadata, LastManifestCommit,
+        Metadata, Protocol, REMOVE_FIELD, SetTransaction, get_commit_schema,
     };
     use crate::arrow::array::{Array as _, AsArray as _, RecordBatch};
     use crate::arrow::datatypes::Int64Type;
@@ -188,8 +188,8 @@ mod tests {
     use crate::engine::CancellableEngine;
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::sync::SyncEngine;
-    use crate::log_segment::LogSegment;
     use crate::log_segment::tests::{add_checkpoint_to_store, latest_log_segment};
+    use crate::log_segment::{CheckpointActionSource, LogSegment};
     use crate::object_store::ObjectStoreExt as _;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
@@ -276,10 +276,18 @@ mod tests {
         commit_schema: SchemaRef,
         checkpoint_schema: SchemaRef,
     ) -> KernelResult<Vec<BatchPaths>> {
+        let source = CheckpointActionSource::ManifestCommit {
+            pointer: LastManifestCommit {
+                version: checkpoint.version(),
+                content_root_version: checkpoint.content_root_version(),
+            },
+            superseded_standalone: None,
+        };
         log_segment
             .read_actions_with_checkpoint_action(
                 engine,
                 checkpoint,
+                &source,
                 &table_root(),
                 commit_schema,
                 checkpoint_schema,

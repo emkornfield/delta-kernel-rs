@@ -10,8 +10,6 @@ use delta_kernel_derive::internal_api;
 use tracing::{debug, error, info, instrument, warn};
 use url::Url;
 
-#[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::FileMeta;
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
 use crate::actions::set_transaction::SetTransactionScanner;
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -31,6 +29,9 @@ use crate::crc::{
 use crate::expressions::ColumnName;
 use crate::incremental_scan::IncrementalScanBuilder;
 use crate::log_replay::ActionsBatch;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::log_segment::CheckpointActionSource;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::log_segment::LastManifestCommitResolution;
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -351,14 +352,14 @@ impl Snapshot {
             return Ok(cached.clone());
         }
         let resolved = match self.checkpoint_source(engine)? {
-            CheckpointSource::None => None,
-            CheckpointSource::Standalone { file, pointer } => Some(
+            None => None,
+            Some(CheckpointActionSource::Standalone { file, pointer }) => Some(
                 read_standalone_checkpoint_action_for_pointer(engine, &file, pointer.as_ref())?,
             ),
-            CheckpointSource::ManifestCommit {
+            Some(CheckpointActionSource::ManifestCommit {
                 pointer,
                 superseded_standalone,
-            } => {
+            }) => {
                 let action = self
                     .log_segment
                     .read_last_checkpoint_action_from_pointer(engine, &pointer)?;
@@ -393,9 +394,27 @@ impl Snapshot {
             return Ok(None);
         }
         Ok(match self.checkpoint_source(engine)? {
-            CheckpointSource::Standalone { file, .. } => Some(file.version),
-            CheckpointSource::None | CheckpointSource::ManifestCommit { .. } => None,
+            Some(CheckpointActionSource::Standalone { file, .. }) => Some(file.version),
+            _ => None,
         })
+    }
+
+    /// The latest checkpoint action (see [`Self::latest_checkpoint_action`]) together with the
+    /// source it is read from.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) fn latest_checkpoint_action_with_source(
+        &self,
+        engine: &dyn Engine,
+    ) -> KernelResult<Option<(Arc<CheckpointAction>, CheckpointActionSource)>> {
+        if !self.has_adaptive_metadata() {
+            return Ok(None);
+        }
+        let Some(source) = self.checkpoint_source(engine)? else {
+            return Ok(None);
+        };
+        Ok(self
+            .latest_checkpoint_action(engine)?
+            .map(|action| (action, source)))
     }
 
     /// Reads this snapshot's log with `schema`, newest first, for log replay. For a table with an
@@ -407,10 +426,11 @@ impl Snapshot {
         schema: SchemaRef,
     ) -> KernelResult<Box<dyn KernelResultIterator<ActionsBatch>>> {
         #[cfg(feature = "adaptive-metadata-in-dev")]
-        if let Some(checkpoint) = self.latest_checkpoint_action(engine)? {
+        if let Some((checkpoint, source)) = self.latest_checkpoint_action_with_source(engine)? {
             let result = self.log_segment.read_actions_with_checkpoint_action(
                 engine,
                 &checkpoint,
+                &source,
                 self.table_root(),
                 schema.clone(),
                 schema,
@@ -1318,7 +1338,10 @@ impl Snapshot {
     /// Decides where the latest checkpoint action is read from. The listed standalone checkpoint
     /// wins unless `lastManifestCommit` is newer than it.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    fn checkpoint_source(&self, engine: &dyn Engine) -> KernelResult<CheckpointSource> {
+    fn checkpoint_source(
+        &self,
+        engine: &dyn Engine,
+    ) -> KernelResult<Option<CheckpointActionSource>> {
         let standalone = self.log_segment.standalone_checkpoint(engine)?;
         let pointer = match self.last_manifest_commit(engine) {
             Ok(pointer) => pointer,
@@ -1328,23 +1351,22 @@ impl Snapshot {
             Err(err) => return Err(err),
         };
         let Some(file) = standalone else {
-            return Ok(match pointer {
-                Some(pointer) => CheckpointSource::ManifestCommit {
+            return Ok(
+                pointer.map(|pointer| CheckpointActionSource::ManifestCommit {
                     pointer,
                     superseded_standalone: None,
-                },
-                None => CheckpointSource::None,
-            });
+                }),
+            );
         };
         let file_version = version_as_i64(file.version)?;
         match pointer {
             Some(pointer) if pointer.version > file_version => {
-                Ok(CheckpointSource::ManifestCommit {
+                Ok(Some(CheckpointActionSource::ManifestCommit {
                     pointer,
                     superseded_standalone: Some(file_version),
-                })
+                }))
             }
-            pointer => Ok(CheckpointSource::Standalone { file, pointer }),
+            pointer => Ok(Some(CheckpointActionSource::Standalone { file, pointer })),
         }
     }
 
@@ -1918,25 +1940,6 @@ fn captured_action_supersedes_checkpoint(
             version_as_i64(checkpoint).is_ok_and(|version| action.version > version)
         }
     }
-}
-
-/// Where [`Snapshot::latest_checkpoint_action`] reads the latest checkpoint action from.
-#[cfg(feature = "adaptive-metadata-in-dev")]
-enum CheckpointSource {
-    /// No checkpoint action at this version.
-    None,
-    /// The listed standalone checkpoint file. `pointer` is the `lastManifestCommit` checked
-    /// against it, or `None` when it cannot be read (see [`Snapshot::latest_checkpoint_action`]).
-    Standalone {
-        file: ParsedLogPath<FileMeta>,
-        pointer: Option<LastManifestCommit>,
-    },
-    /// The manifest commit that `pointer` names. `superseded_standalone` is the version of the
-    /// listed standalone checkpoint that this commit supersedes, if any.
-    ManifestCommit {
-        pointer: LastManifestCommit,
-        superseded_standalone: Option<i64>,
-    },
 }
 
 // TODO: unify this and lots of stuff in LogSegment tests and test_utils.
