@@ -5,7 +5,7 @@ use itertools::Itertools;
 use url::Url;
 
 use super::COMPACTION_ACTIONS_SCHEMA;
-use crate::action_reconciliation::log_replay::ActionReconciliationProcessor;
+use crate::action_reconciliation::log_replay::{ActionReconciliationProcessor, RemoveRetention};
 use crate::action_reconciliation::{ActionReconciliationIterator, RetentionCalculator};
 use crate::log_replay::HasSelectionVector;
 use crate::log_segment::LogSegment;
@@ -127,7 +127,7 @@ impl LogCompactionWriter {
         // Create action reconciliation processor for compaction
         // This reuses the same reconciliation logic as checkpoints
         let mut processor = ActionReconciliationProcessor::new(
-            min_file_retention_timestamp_millis,
+            RemoveRetention::ExpireAtOrBefore(min_file_retention_timestamp_millis),
             self.get_transaction_expiration_timestamp()?,
             self.snapshot.table_configuration().dv_normalization_root(),
         );

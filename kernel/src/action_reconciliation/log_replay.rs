@@ -13,8 +13,8 @@
 //! 2. **Txn Actions**: Keeps exactly one `txn` action for each unique app ID, always selecting the
 //!    latest one encountered.
 //! 3. **File Actions**: Resolves file actions to produce the latest state of the table, keeping the
-//!    most recent valid add actions and unexpired remove actions (tombstones) that are newer than
-//!    `minimum_file_retention_timestamp`.
+//!    most recent valid add actions and the remove actions (tombstones) kept by the
+//!    [`RemoveRetention`] policy.
 //!
 //! ## Architecture
 //!
@@ -42,6 +42,14 @@ use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, column_name};
 use crate::utils::require;
 use crate::{KernelError, KernelResult, KernelResultIterator};
 
+/// Determines which remove actions (tombstones) action reconciliation keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoveRetention {
+    /// Expires removes whose `deletionTimestamp` is at or before the given timestamp in
+    /// milliseconds. A remove without a `deletionTimestamp` counts as expired.
+    ExpireAtOrBefore(i64),
+}
+
 /// Filters log segment actions for action reconciliation.
 pub(crate) struct ActionReconciliationProcessor {
     /// Tracks file actions that have been seen during log replay to avoid duplicates.
@@ -56,8 +64,8 @@ pub(crate) struct ActionReconciliationProcessor {
     /// Set of domain names that have been processed to avoid duplicates.
     /// For each unique domain, only the first (newest) domain metadata action is kept.
     seen_domains: HashSet<String>,
-    /// Minimum timestamp for file retention, used for filtering expired tombstones.
-    minimum_file_retention_timestamp: i64,
+    /// Policy for keeping remove actions (tombstones).
+    remove_retention: RemoveRetention,
     /// Transaction expiration timestamp for filtering old transactions
     txn_expiration_timestamp: Option<i64>,
     /// Table root for normalizing paths. `Some` iff adaptiveMetadata is enabled.
@@ -209,7 +217,7 @@ impl ActionReconciliationProcessor {
             &mut self.seen_file_keys,
             is_log_batch,
             selection_vector,
-            self.minimum_file_retention_timestamp,
+            self.remove_retention,
             self.seen_protocol,
             self.seen_metadata,
             &mut self.seen_txns,
@@ -233,7 +241,7 @@ impl ActionReconciliationProcessor {
     }
 
     pub(crate) fn new(
-        minimum_file_retention_timestamp: i64,
+        remove_retention: RemoveRetention,
         txn_expiration_timestamp: Option<i64>,
         dv_normalization_root: Option<Url>,
     ) -> Self {
@@ -243,7 +251,7 @@ impl ActionReconciliationProcessor {
             seen_metadata: false,
             seen_txns: Default::default(),
             seen_domains: Default::default(),
-            minimum_file_retention_timestamp,
+            remove_retention,
             txn_expiration_timestamp,
             dv_normalization_root,
         }
@@ -259,11 +267,11 @@ impl ActionReconciliationProcessor {
 /// # File Action Filtering Rules:
 ///   Kept Actions:
 /// - The first (newest) add action for each unique (path, dvId) pair
-/// - The first (newest) remove action for each unique (path, dvId) pair, but only if its
-///   deletionTimestamp > minimumFileRetentionTimestamp Omitted Actions:
+/// - The first (newest) remove action for each unique (path, dvId) pair, but only if the
+///   [`RemoveRetention`] policy keeps it. Omitted Actions:
 /// - Any file action (add/remove) with the same (path, dvId) as a previously processed action
-/// - All remove actions with deletionTimestamp ≤ minimumFileRetentionTimestamp
-/// - All remove actions with missing deletionTimestamp (defaults to 0)
+/// - All remove actions the [`RemoveRetention`] policy expires (under `ExpireAtOrBefore`, a remove
+///   without a deletionTimestamp counts as expired)
 ///
 /// The resulting filtered file actions represents files present in the table (add actions) and
 /// unexpired tombstones required for vacuum operations (remove actions).
@@ -304,8 +312,8 @@ pub(crate) struct ActionReconciliationVisitor<'seen> {
     actions_count: i64,
     // i64 to match the `_last_checkpoint` file schema
     add_actions_count: i64,
-    // i64 for comparison with remove.deletionTimestamp
-    minimum_file_retention_timestamp: i64,
+    // Policy for keeping remove actions, applied to each remove's deletionTimestamp
+    remove_retention: RemoveRetention,
     // Flag to track if we've seen a protocol action so we can keep only the first protocol action
     seen_protocol: bool,
     // Flag to track if we've seen a metadata action so we can keep only the first metadata action
@@ -372,7 +380,7 @@ impl ActionReconciliationVisitor<'_> {
         seen_file_keys: &'seen mut HashSet<FileActionKey>,
         is_log_batch: bool,
         selection_vector: Vec<bool>,
-        minimum_file_retention_timestamp: i64,
+        remove_retention: RemoveRetention,
         seen_protocol: bool,
         seen_metadata: bool,
         seen_txns: &'seen mut HashSet<String>,
@@ -394,7 +402,7 @@ impl ActionReconciliationVisitor<'_> {
             selection_vector,
             actions_count: 0,
             add_actions_count: 0,
-            minimum_file_retention_timestamp,
+            remove_retention,
             seen_protocol,
             seen_metadata,
             seen_txns,
@@ -410,22 +418,24 @@ impl ActionReconciliationVisitor<'_> {
     /// are kept to allow concurrent readers to read snapshots at older versions.
     ///
     /// Tombstone expiration rules:
-    /// - If deletion_timestamp <= minimum_file_retention_timestamp: Expired (exclude)
-    /// - If deletion_timestamp > minimum_file_retention_timestamp: Valid (include)
+    /// - If deletion_timestamp <= the policy timestamp: Expired (exclude)
+    /// - If deletion_timestamp > the policy timestamp: Valid (include)
     /// - If deletion_timestamp is missing: Defaults to 0, treated as expired (exclude)
     fn is_expired_tombstone<'a>(
         &self,
         i: usize,
         getter: &'a dyn GetData<'a>,
     ) -> KernelResult<bool> {
-        // Ideally this should never be zero, but we are following the same behavior as Delta
-        // Spark and the Java Kernel.
-        // Note: When remove.deletion_timestamp is not present (defaulting to 0), the remove action
-        // will be excluded as it will be treated as expired.
-        let deletion_timestamp = getter.get_opt(i, Self::REMOVE_DELETION_TIMESTAMP.name)?;
-        let deletion_timestamp = deletion_timestamp.unwrap_or(0i64);
+        match self.remove_retention {
+            RemoveRetention::ExpireAtOrBefore(minimum_timestamp) => {
+                // A missing deletionTimestamp defaults to 0 and is treated as expired, matching
+                // Delta Spark and the Java Kernel.
+                let deletion_timestamp = getter.get_opt(i, Self::REMOVE_DELETION_TIMESTAMP.name)?;
+                let deletion_timestamp = deletion_timestamp.unwrap_or(0i64);
 
-        Ok(deletion_timestamp <= self.minimum_file_retention_timestamp)
+                Ok(deletion_timestamp <= minimum_timestamp)
+            }
+        }
     }
 
     /// Processes a potential file action to determine if it should be included.
@@ -709,7 +719,8 @@ mod tests {
     fn run_action_reconciliation_test(
         input_batches: Vec<ActionsBatch>,
     ) -> KernelResult<(Vec<FilteredEngineData>, i64, i64)> {
-        let mut processor = ActionReconciliationProcessor::new(0, None, None);
+        let mut processor =
+            ActionReconciliationProcessor::new(RemoveRetention::ExpireAtOrBefore(0), None, None);
         let processed_batches: Vec<_> = input_batches
             .into_iter()
             .map(move |batch| processor.process_actions_batch(batch))
@@ -734,7 +745,7 @@ mod tests {
             &mut seen_file_keys,
             true,
             vec![true; 9],
-            0, // minimum_file_retention_timestamp (no expired tombstones)
+            RemoveRetention::ExpireAtOrBefore(0),
             false,
             false,
             &mut seen_txns,
@@ -769,10 +780,9 @@ mod tests {
 
     /// Tests the boundary conditions for tombstone expiration logic.
     /// Specifically checks:
-    /// - Remove actions with deletionTimestamp == minimumFileRetentionTimestamp (should be
-    ///   excluded)
-    /// - Remove actions with deletionTimestamp < minimumFileRetentionTimestamp (should be excluded)
-    /// - Remove actions with deletionTimestamp > minimumFileRetentionTimestamp (should be included)
+    /// - Remove actions with deletionTimestamp == the expiration timestamp (should be excluded)
+    /// - Remove actions with deletionTimestamp < the expiration timestamp (should be excluded)
+    /// - Remove actions with deletionTimestamp > the expiration timestamp (should be included)
     /// - Remove actions with missing deletionTimestamp (defaults to 0, should be excluded)
     #[test]
     fn test_action_reconciliation_visitor_boundary_cases_for_tombstone_expiration()
@@ -794,7 +804,7 @@ mod tests {
             &mut seen_file_keys,
             true,
             vec![true; 4],
-            100, // minimum_file_retention_timestamp (threshold set to 100)
+            RemoveRetention::ExpireAtOrBefore(100),
             false,
             false,
             &mut seen_txns,
@@ -828,7 +838,7 @@ mod tests {
             &mut seen_file_keys,
             false, // is_log_batch = false (batch)
             vec![true; 1],
-            0,
+            RemoveRetention::ExpireAtOrBefore(0),
             false,
             false,
             &mut seen_txns,
@@ -870,7 +880,7 @@ mod tests {
             &mut seen_file_keys,
             true,
             vec![true; 3],
-            0,
+            RemoveRetention::ExpireAtOrBefore(0),
             false,
             false,
             &mut seen_txns,
@@ -908,7 +918,7 @@ mod tests {
             &mut seen_file_keys,
             true,
             vec![true; 3],
-            0,
+            RemoveRetention::ExpireAtOrBefore(0),
             true,           // The visitor has already seen a protocol action
             true,           // The visitor has already seen a metadata action
             &mut seen_txns, // Pre-populated transaction
@@ -949,7 +959,7 @@ mod tests {
             &mut seen_file_keys,
             true, // is_log_batch
             vec![true; 7],
-            0, // minimum_file_retention_timestamp
+            RemoveRetention::ExpireAtOrBefore(0),
             false,
             false,
             &mut seen_txns,
@@ -1111,7 +1121,7 @@ mod tests {
             &mut seen_file_keys,
             true,
             vec![true; 4],
-            0,
+            RemoveRetention::ExpireAtOrBefore(0),
             false,
             false,
             &mut seen_txns,
@@ -1154,7 +1164,7 @@ mod tests {
             &mut seen_file_keys,
             true,
             vec![true; 2],
-            0,
+            RemoveRetention::ExpireAtOrBefore(0),
             false,
             false,
             &mut seen_txns,
@@ -1194,7 +1204,11 @@ mod tests {
         let input_batches = vec![create_batch(batch1)?, create_batch(batch2)?];
 
         // Create processor with txn expiration timestamp
-        let mut processor = ActionReconciliationProcessor::new(0, Some(1000), None);
+        let mut processor = ActionReconciliationProcessor::new(
+            RemoveRetention::ExpireAtOrBefore(0),
+            Some(1000),
+            None,
+        );
         let results: Vec<_> = input_batches
             .into_iter()
             .map(move |batch| processor.process_actions_batch(batch))
@@ -1308,7 +1322,7 @@ mod tests {
             seen_file_keys,
             true,
             vec![true; 1],
-            0,
+            RemoveRetention::ExpireAtOrBefore(0),
             false,
             false,
             seen_txns,
@@ -1461,7 +1475,8 @@ mod tests {
         // Create a processor and try to process the batch
         // We can't easily trigger an error in the normal flow since parse_json_batch creates valid
         // data But this test ensures the error propagation path exists and is tested
-        let mut processor = ActionReconciliationProcessor::new(0, None, None);
+        let mut processor =
+            ActionReconciliationProcessor::new(RemoveRetention::ExpireAtOrBefore(0), None, None);
         let result = processor.process_actions_batch(batch);
 
         // This should succeed - the test mainly verifies that the error propagation paths compile

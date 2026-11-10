@@ -226,7 +226,9 @@ mod tests {
 
     use super::*;
     use crate::action_reconciliation::file_metadata::build_checkpoint_read_schema;
-    use crate::action_reconciliation::log_replay::ActionReconciliationProcessor;
+    use crate::action_reconciliation::log_replay::{
+        ActionReconciliationProcessor, RemoveRetention,
+    };
     use crate::actions::{Metadata, Protocol};
     use crate::arrow::array::StringArray;
     use crate::checkpoint::{CHECKPOINT_ACTIONS_SCHEMA_V1, CheckpointWriter};
@@ -539,7 +541,11 @@ mod tests {
                 },
             },
         };
-        let mut processor = ActionReconciliationProcessor::new(i64::MAX, None, None);
+        let mut processor = ActionReconciliationProcessor::new(
+            RemoveRetention::ExpireAtOrBefore(i64::MAX),
+            None,
+            None,
+        );
         let mut batches = snapshot
             .log_segment()
             .read_actions(&engine, CHECKPOINT_ACTIONS_SCHEMA_V1.clone())?
