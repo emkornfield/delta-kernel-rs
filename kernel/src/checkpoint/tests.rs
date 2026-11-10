@@ -723,7 +723,9 @@ async fn test_no_checkpoint_on_unpublished_snapshot() -> Result<()> {
 }
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
-async fn adaptive_metadata_table_without_tree() -> Result<(SyncEngine, SnapshotRef)> {
+async fn adaptive_metadata_table_without_tree(
+    later_commits: Vec<Vec<Action>>,
+) -> Result<(Arc<InMemory>, SyncEngine, SnapshotRef)> {
     let (store, _) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
     let config = adaptive_metadata_table_configuration(test_schema_flat_with_column_mapping(), &[]);
@@ -737,8 +739,11 @@ async fn adaptive_metadata_table_without_tree() -> Result<(SyncEngine, SnapshotR
     add_commit("memory:///", store.as_ref(), 0, commit)
         .await
         .unwrap();
+    for (version, actions) in (1..).zip(later_commits) {
+        write_commit_to_store(&store, actions, version).await?;
+    }
     let snapshot = Snapshot::builder_for("memory:///").build(&engine)?;
-    Ok((engine, snapshot))
+    Ok((store, engine, snapshot))
 }
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -747,7 +752,7 @@ async fn adaptive_metadata_table_without_tree() -> Result<(SyncEngine, SnapshotR
 async fn test_adaptive_metadata_table_without_tree_writes_enabled_checkpoint_format(
     #[values(None, Some(CheckpointSpec::V1))] spec: Option<CheckpointSpec>,
 ) -> Result<()> {
-    let (engine, snapshot) = adaptive_metadata_table_without_tree().await?;
+    let (_, engine, snapshot) = adaptive_metadata_table_without_tree(vec![]).await?;
 
     let (result, checkpointed) = snapshot.checkpoint(&engine, spec.as_ref())?;
 
@@ -760,9 +765,38 @@ async fn test_adaptive_metadata_table_without_tree_writes_enabled_checkpoint_for
 }
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
+#[rstest::rstest]
+#[tokio::test]
+async fn test_adaptive_metadata_table_without_tree_checkpoint_drops_removes_and_cancelled_adds(
+    #[values(None, Some(CheckpointSpec::V1))] spec: Option<CheckpointSpec>,
+) -> Result<()> {
+    let (store, engine, snapshot) = adaptive_metadata_table_without_tree(vec![
+        vec![
+            create_add_action("kept.parquet"),
+            create_add_action("removed.parquet"),
+        ],
+        vec![create_remove_action("removed.parquet")],
+    ])
+    .await?;
+
+    let (result, _) = snapshot.checkpoint(&engine, spec.as_ref())?;
+    assert_eq!(result, CheckpointWriteResult::Written);
+
+    // Metadata, protocol, and the surviving add. The remove and the add it cancels are dropped.
+    let checkpoint_path = Path::from("_delta_log/00000000000000000002.checkpoint.parquet");
+    let checkpoint_size = store
+        .head(&checkpoint_path)
+        .await
+        .map_err(KernelError::from)?
+        .size;
+    assert_last_checkpoint_contents(&store, 2, 3, 1, checkpoint_size).await?;
+    Ok(())
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
 #[tokio::test]
 async fn test_adaptive_metadata_table_without_tree_rejects_v2_checkpoint() -> Result<()> {
-    let (engine, snapshot) = adaptive_metadata_table_without_tree().await?;
+    let (_, engine, snapshot) = adaptive_metadata_table_without_tree(vec![]).await?;
     let spec = CheckpointSpec::V2(V2CheckpointConfig::NoSidecar);
     assert_result_error_with_message(
         snapshot.checkpoint(&engine, Some(&spec)),

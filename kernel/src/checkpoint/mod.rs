@@ -454,6 +454,23 @@ impl CheckpointWriter {
             .map(|(data, _)| data)
     }
 
+    /// Returns which remove actions this checkpoint keeps.
+    fn remove_retention(&self) -> KernelResult<RemoveRetention> {
+        // Reconciled adaptiveMetadata state carries no removes (RFC "Action Reconciliation").
+        // ensure_checkpoint_supported guarantees there is no metadata tree to supply them.
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        if self
+            .snapshot
+            .table_configuration()
+            .is_feature_enabled(&TableFeature::AdaptiveMetadataPreview)
+        {
+            return Ok(RemoveRetention::DropAll);
+        }
+        Ok(RemoveRetention::ExpireAtOrBefore(
+            self.deleted_file_retention_timestamp()?,
+        ))
+    }
+
     /// Prepares checkpoint data and its output schema using the same replay for collation sampling.
     fn checkpoint_data_with_schema(
         &self,
@@ -467,7 +484,7 @@ impl CheckpointWriter {
 
         // Process actions through reconciliation
         let mut processor = ActionReconciliationProcessor::new(
-            RemoveRetention::ExpireAtOrBefore(self.deleted_file_retention_timestamp()?),
+            self.remove_retention()?,
             self.get_transaction_expiration_timestamp()?,
             self.snapshot.table_configuration().dv_normalization_root(),
         );
