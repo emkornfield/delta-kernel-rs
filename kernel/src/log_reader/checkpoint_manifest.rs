@@ -5,6 +5,7 @@ use std::sync::Arc;
 use itertools::Itertools;
 use url::Url;
 
+use crate::actions::is_standalone_checkpoint_schema;
 use crate::actions::visitors::SidecarVisitor;
 use crate::log_replay::ActionsBatch;
 use crate::path::ParsedLogPath;
@@ -17,7 +18,8 @@ use crate::{Engine, FileMeta, KernelError, KernelResult, KernelResultIterator, R
 #[allow(unused)]
 pub(crate) struct CheckpointManifestReader {
     actions: Box<dyn KernelResultIterator<ActionsBatch>>,
-    sidecar_visitor: SidecarVisitor,
+    // Absent for a standalone checkpoint, whose `sidecar` rows are typed AMT sidecars.
+    sidecar_visitor: Option<SidecarVisitor>,
     log_root: Url,
     is_complete: bool,
     manifest_file: FileMeta,
@@ -61,9 +63,11 @@ impl CheckpointManifestReader {
         };
 
         let actions = Box::new(actions.map_ok(|batch_res| ActionsBatch::new(batch_res, false)));
+        let sidecar_visitor =
+            (!is_standalone_checkpoint(engine.as_ref(), manifest)?).then(SidecarVisitor::default);
         Ok(Self {
             actions,
-            sidecar_visitor: SidecarVisitor::default(),
+            sidecar_visitor,
             log_root,
             is_complete: false,
             manifest_file: manifest.location.clone(),
@@ -82,8 +86,10 @@ impl CheckpointManifestReader {
             ))
         );
 
-        let sidecars: Vec<_> = self
-            .sidecar_visitor
+        let Some(sidecar_visitor) = self.sidecar_visitor else {
+            return Ok(vec![]);
+        };
+        let sidecars: Vec<_> = sidecar_visitor
             .sidecars
             .into_iter()
             .map(|s| s.to_filemeta(&self.log_root))
@@ -103,10 +109,26 @@ impl Iterator for CheckpointManifestReader {
         };
 
         Some(result.and_then(|batch| {
-            self.sidecar_visitor.visit_rows_of(batch.actions())?;
+            if let Some(sidecar_visitor) = &mut self.sidecar_visitor {
+                sidecar_visitor.visit_rows_of(batch.actions())?;
+            }
             Ok(batch)
         }))
     }
+}
+
+/// Whether `manifest` is a standalone adaptiveMetadata checkpoint, which only parquet files can be.
+/// Reads the parquet footer to tell, since the read schema does not carry the `contentRoot` column.
+fn is_standalone_checkpoint(engine: &dyn Engine, manifest: &ParsedLogPath) -> KernelResult<bool> {
+    // Without the feature no checkpoint is standalone, so skip the footer read on every
+    // parquet checkpoint.
+    if !cfg!(feature = "adaptive-metadata-in-dev") || manifest.extension != "parquet" {
+        return Ok(false);
+    }
+    let footer = engine
+        .parquet_handler()
+        .read_parquet_footer(&manifest.location)?;
+    Ok(is_standalone_checkpoint_schema(&footer.schema))
 }
 
 #[cfg(test)]
@@ -116,10 +138,16 @@ mod tests {
     use itertools::Itertools;
 
     use super::*;
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::Snapshot;
     use crate::actions::{ADD_FIELD, REMOVE_FIELD, SIDECAR_FIELD};
     use crate::arrow::array::{Array, StringArray, StructArray};
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::schema::schema_ref;
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::unit_test_utils::adaptive_metadata_fixtures::{
+        minimal_checkpoint_action, setup_table, write_manifest_commit, write_standalone_checkpoint,
+    };
     use crate::unit_test_utils::{assert_result_error_with_message, load_test_table};
     use crate::{KernelResult, Result, SnapshotRef};
 
@@ -268,5 +296,29 @@ mod tests {
             (&REMOVE_FIELD),
             (&SIDECAR_FIELD),
         }
+    }
+
+    /// A standalone checkpoint's typed `sidecar` rows are AMT sidecars, so the manifest reader
+    /// must not report them as file sidecars.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn standalone_checkpoint_reports_no_file_sidecars() -> Result<()> {
+        let (engine, table_root) = setup_table()?;
+        let checkpoint = minimal_checkpoint_action("metadata/root.parquet", 1)?;
+        write_manifest_commit(&engine, &table_root, 1, checkpoint)?;
+        write_standalone_checkpoint(&engine, &table_root, 1, true)?;
+
+        let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+        let log_segment = snapshot.log_segment();
+        let checkpoint = &log_segment.listed.checkpoint_parts[0];
+        let mut reader = CheckpointManifestReader::try_new(
+            Arc::new(engine),
+            checkpoint,
+            log_segment.log_root.clone(),
+            manifest_read_schema(),
+        )?;
+        reader.by_ref().try_for_each(|batch| batch.map(drop))?;
+        assert!(reader.extract_sidecars()?.is_empty());
+        Ok(())
     }
 }

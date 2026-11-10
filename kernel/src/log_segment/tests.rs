@@ -49,7 +49,7 @@ use crate::schema::{
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
     adaptive_metadata_protocol_and_metadata, minimal_checkpoint_action, setup_table,
-    write_manifest_commit, write_manifest_commit_keeping_pm,
+    write_manifest_commit, write_manifest_commit_keeping_pm, write_standalone_checkpoint,
 };
 use crate::unit_test_utils::{
     Action, assert_batch_matches, assert_result_error_with_message, create_log_path,
@@ -3750,6 +3750,31 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint(
     }
     assert!(sidecars.is_empty(), "V1 checkpoint should have no sidecars");
 
+    Ok(())
+}
+
+/// A standalone checkpoint's typed `sidecar` rows are AMT sidecars, so its file actions are read
+/// from its own footer and no V2 file sidecar is listed.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[rstest]
+fn test_get_file_actions_schema_standalone_checkpoint_has_no_file_sidecars(
+    #[values(false, true)] typed_sidecars: bool,
+) -> Result<()> {
+    let (engine, table_root) = setup_table()?;
+    let checkpoint = minimal_checkpoint_action("metadata/root.parquet", 1)?;
+    write_manifest_commit(&engine, &table_root, 1, checkpoint)?;
+    write_standalone_checkpoint(&engine, &table_root, 1, typed_sidecars)?;
+
+    let log_segment = latest_log_segment(&table_root, &engine);
+    let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine)?;
+    assert!(
+        schema.is_some(),
+        "standalone checkpoint yields its footer schema"
+    );
+    assert!(
+        sidecars.is_empty(),
+        "standalone checkpoint has no file sidecars"
+    );
     Ok(())
 }
 

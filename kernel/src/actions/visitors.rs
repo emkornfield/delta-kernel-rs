@@ -403,6 +403,8 @@ impl RowVisitor for SetTransactionVisitor {
     }
 }
 
+/// Collects V2 file-action sidecar references. Callers must not run it over a standalone
+/// checkpoint, whose `sidecar` rows are typed AMT sidecars (see `is_standalone_checkpoint_schema`).
 #[derive(Default)]
 #[internal_api]
 pub(crate) struct SidecarVisitor {

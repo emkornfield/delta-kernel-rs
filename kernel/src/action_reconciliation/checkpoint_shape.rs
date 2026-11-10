@@ -14,8 +14,8 @@ use std::sync::Arc;
 
 use url::Url;
 
-use crate::actions::SIDECAR_NAME;
 use crate::actions::visitors::SidecarVisitor;
+use crate::actions::{SIDECAR_NAME, has_file_action_sidecar_column};
 use crate::checkpoint::CHECKPOINT_ACTIONS_SCHEMA_V2;
 use crate::engine_data::RowVisitor;
 use crate::expressions::col;
@@ -118,8 +118,9 @@ impl CheckpointShape {
                     Some(schema) => schema,
                     None => read_parquet_footer_schema(exec, root_checkpoint.clone())?,
                 };
-                // No `sidecar` column means the file actions are inline, so this is a leaf.
-                if !cp_schema.contains(SIDECAR_NAME) {
+                // File actions are inline when there is no `sidecar` column. A standalone
+                // checkpoint also keeps them inline, and its `sidecar` rows are AMT sidecars.
+                if !has_file_action_sidecar_column(&cp_schema) {
                     return Ok(Self::new_leaf(needs_leaf_schema.then_some(cp_schema)));
                 }
                 // The `sidecar` column may still be all-null (not a manifest), so scan it to
@@ -324,9 +325,18 @@ mod tests {
     use crate::engine::sync::plan::SyncPlanExecutor;
     use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpointV2};
     use crate::log_segment_files::LogSegmentFiles;
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::object_store::DynObjectStore;
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::object_store::memory::InMemory;
     use crate::plans::ir::nodes::Operator;
     use crate::plans::{IoOperation, PlanResult};
     use crate::schema::{schema, schema_ref};
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::unit_test_utils::adaptive_metadata_fixtures::{
+        minimal_checkpoint_action, setup_table_on, write_manifest_commit,
+        write_standalone_checkpoint,
+    };
     use crate::unit_test_utils::{
         copy_test_table, create_log_path, create_log_path_with_size, load_test_table,
     };
@@ -464,6 +474,23 @@ mod tests {
             assert!(schema.contains("add"), "{table}: retained add action");
             assert!(schema.contains("remove"), "{table}: retained remove action");
         }
+    }
+
+    /// A standalone checkpoint keeps its file actions inline, so it is a leaf even when its typed
+    /// `sidecar` rows would otherwise make it look like a V2 manifest.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest]
+    fn standalone_checkpoint_is_leaf(#[values(false, true)] typed_sidecars: bool) {
+        let store: Arc<DynObjectStore> = Arc::new(InMemory::new());
+        let (engine, table_root) = setup_table_on(store.clone()).unwrap();
+        let checkpoint = minimal_checkpoint_action("metadata/root.parquet", 1).unwrap();
+        write_manifest_commit(&engine, &table_root, 1, checkpoint).unwrap();
+        write_standalone_checkpoint(&engine, &table_root, 1, typed_sidecars).unwrap();
+
+        let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+        let exec = SyncPlanExecutor::new(Some(store));
+        let shape = CheckpointShape::try_new(&exec, &snapshot).unwrap();
+        assert_eq!(shape.checkpoint_type, CheckpointType::Leaf);
     }
 
     /// Requested stats schema for the `*-struct-stats-only` fixtures (`id: long`, `value: string`),
