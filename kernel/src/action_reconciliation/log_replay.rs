@@ -48,6 +48,9 @@ pub(crate) enum RemoveRetention {
     /// Expires removes whose `deletionTimestamp` is at or before the given timestamp in
     /// milliseconds. A remove without a `deletionTimestamp` counts as expired.
     ExpireAtOrBefore(i64),
+    /// Keeps every remove action, including those with a null `deletionTimestamp`.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    KeepAll,
     /// Drops every remove action. Removes still cancel older adds of the same file.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     DropAll,
@@ -73,6 +76,8 @@ pub(crate) struct ActionReconciliationProcessor {
     txn_expiration_timestamp: Option<i64>,
     /// Table root for normalizing paths. `Some` iff adaptiveMetadata is enabled.
     dv_normalization_root: Option<Url>,
+    /// Whether to drop non-file actions, leaving only the reconciled add and remove actions.
+    file_actions_only: bool,
 }
 
 /// This struct is the output of the [`ActionReconciliationProcessor`].
@@ -228,6 +233,7 @@ impl ActionReconciliationProcessor {
             self.txn_expiration_timestamp,
             self.dv_normalization_root.clone(),
         );
+        visitor.file_actions_only = self.file_actions_only;
         visitor.visit_rows_of(actions.as_ref())?;
 
         // Update protocol and metadata seen flags
@@ -257,7 +263,16 @@ impl ActionReconciliationProcessor {
             remove_retention,
             txn_expiration_timestamp,
             dv_normalization_root,
+            file_actions_only: false,
         }
+    }
+
+    /// Restricts the output to add and remove actions. Non-file actions are not selected and do
+    /// not update their deduplication state.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) fn with_file_actions_only(mut self) -> Self {
+        self.file_actions_only = true;
+        self
     }
 }
 
@@ -330,6 +345,8 @@ pub(crate) struct ActionReconciliationVisitor<'seen> {
     seen_domains: &'seen mut HashSet<String>,
     /// Transaction expiration timestamp for filtering old transactions
     txn_expiration_timestamp: Option<i64>,
+    // Set by the processor. Selects only file actions, so non-file rows are never kept.
+    file_actions_only: bool,
 }
 
 /// A projected column used by `ActionReconciliationVisitor`.
@@ -411,6 +428,7 @@ impl ActionReconciliationVisitor<'_> {
             seen_txns,
             seen_domains,
             txn_expiration_timestamp,
+            file_actions_only: false,
         }
     }
 
@@ -434,6 +452,8 @@ impl ActionReconciliationVisitor<'_> {
 
                 Ok(deletion_timestamp <= minimum_timestamp)
             }
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            RemoveRetention::KeepAll => Ok(false),
             #[cfg(feature = "adaptive-metadata-in-dev")]
             RemoveRetention::DropAll => Ok(true),
         }
@@ -620,6 +640,8 @@ impl ActionReconciliationVisitor<'_> {
     ) -> KernelResult<bool> {
         let is_valid = if let Some(result) = self.check_file_action(i, getters)? {
             result
+        } else if self.file_actions_only {
+            false
         } else if let Some(result) = self.check_txn_action(i, getters)? {
             result
         } else if let Some(result) = self.check_domain_metadata_action(i, getters)? {

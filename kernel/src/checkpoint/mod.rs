@@ -143,6 +143,8 @@ use crate::{
 
 pub(crate) mod collation_stats;
 mod sidecar;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+mod standalone;
 
 use sidecar::{SidecarSplitter, SingleSidecarDataIterator, create_sidecar_action_batch};
 #[cfg(test)]
