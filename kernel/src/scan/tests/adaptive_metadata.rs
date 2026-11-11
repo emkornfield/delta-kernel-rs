@@ -3,19 +3,28 @@
 
 use std::sync::Arc;
 
+use futures::executor::block_on;
 use itertools::Itertools as _;
 use rstest::rstest;
 use serde_json::json;
+use test_utils::delta_path_for_version;
 use url::Url;
 
 use super::get_files_for_scan;
-use crate::arrow::array::StringArray;
+use crate::actions::{DomainMetadata, LOG_DOMAIN_METADATA_SCHEMA};
+use crate::arrow::array::{Array as _, AsArray as _, StringArray};
+use crate::checkpoint::STANDALONE_CHECKPOINT_ACTIONS_SCHEMA;
 use crate::content_tree::test_utils::{
     added_data_entry, data_manifest_entry, test_dv_info, write_manifest,
 };
-use crate::content_tree::{ContentTreeNodeEntry, TrackingInfo, TrackingStatus};
+use crate::content_tree::{
+    ContentTreeNodeEntry, TrackingInfo, TrackingStatus, read_standalone_checkpoint_file_actions,
+};
+use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::sync::SyncEngine;
 use crate::expressions::{Predicate as Pred, col, lit};
+use crate::log_segment::CheckpointActionSource;
+use crate::object_store::ObjectStoreExt as _;
 use crate::object_store::memory::InMemory;
 use crate::scan::{Scan, ScanMetadata};
 use crate::schema::schema_ref;
@@ -23,7 +32,7 @@ use crate::transaction::BASE_ADD_FILES_SCHEMA;
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
     checkpoint_action_with_root, commit_file_changes, commit_files, commit_root_manifest,
     commit_root_manifest_file, create_adaptive_metadata_table, setup_adaptive_metadata_table,
-    write_commit_after_manifest_commit, write_manifest_commit_keeping_pm,
+    write_commit_after_manifest_commit, write_manifest_commit_keeping_pm, write_sidecar,
 };
 use crate::unit_test_utils::{
     assert_result_error_with_message, parse_json_batch, string_array_to_engine_data,
@@ -31,6 +40,9 @@ use crate::unit_test_utils::{
 use crate::{Engine, EngineData, FileMeta, KernelResult, Snapshot, Version};
 
 const TABLE_ROOT: &str = "memory:///";
+
+/// The manifest commit that the standalone chain tests build on.
+const MANIFEST_VERSION: Version = 1;
 
 fn table_root() -> Url {
     Url::parse(TABLE_ROOT).unwrap()
@@ -550,4 +562,184 @@ fn scan_metadata_from_hint_before_checkpoint_action_rescans(
     }
     paths.sort();
     assert_eq!(paths, strings(expected));
+}
+
+/// A raw commit line adding `path`.
+fn add_line(path: &str) -> serde_json::Value {
+    json!({ "add": { "path": path, "partitionValues": {}, "size": 1,
+                     "modificationTime": 0, "dataChange": true } })
+}
+
+/// A raw commit line removing `path`.
+fn remove_line(path: &str) -> serde_json::Value {
+    json!({ "remove": { "path": path, "dataChange": true } })
+}
+
+/// A raw commit line setting the transaction `app_id` to `version`.
+fn txn_line(app_id: &str, version: i64) -> serde_json::Value {
+    json!({ "txn": { "appId": app_id, "version": version } })
+}
+
+/// Writes `lines` as the commit at `version`, which follows the manifest commit at
+/// [`MANIFEST_VERSION`] and so carries its pointer.
+fn write_raw_commit(engine: &SyncEngine, version: Version, lines: &[serde_json::Value]) {
+    let lines: Vec<String> = lines.iter().map(ToString::to_string).collect();
+    write_commit_after_manifest_commit(
+        engine,
+        &table_root(),
+        version,
+        MANIFEST_VERSION,
+        parse_json_batch(StringArray::from(lines)),
+    )
+    .unwrap();
+}
+
+/// The `(adds, removes)` paths inline in the standalone checkpoint file that `snapshot`'s latest
+/// checkpoint action is read from.
+fn inline_paths(engine: &SyncEngine, snapshot: &Snapshot) -> (Vec<String>, Vec<String>) {
+    let Some((_, CheckpointActionSource::Standalone { file, .. })) = snapshot
+        .latest_checkpoint_action_with_source(engine)
+        .unwrap()
+    else {
+        panic!("latest checkpoint action is not read from a standalone file");
+    };
+    let (mut adds, mut removes) = (vec![], vec![]);
+    let batches = read_standalone_checkpoint_file_actions(
+        engine,
+        &file.location,
+        STANDALONE_CHECKPOINT_ACTIONS_SCHEMA.clone(),
+    )
+    .unwrap();
+    for batch in batches {
+        let data = ArrowEngineData::try_from_engine_data(batch.unwrap().actions).unwrap();
+        let record_batch = data.record_batch();
+        let add = record_batch.column_by_name("add").unwrap().as_struct();
+        let remove = record_batch.column_by_name("remove").unwrap().as_struct();
+        let add_paths = add.column_by_name("path").unwrap().as_string::<i32>();
+        let remove_paths = remove.column_by_name("path").unwrap().as_string::<i32>();
+        for row in 0..record_batch.num_rows() {
+            if add.is_valid(row) {
+                adds.push(add_paths.value(row).to_string());
+            } else if remove.is_valid(row) {
+                removes.push(remove_paths.value(row).to_string());
+            }
+        }
+    }
+    adds.sort();
+    removes.sort();
+    (adds, removes)
+}
+
+/// Writes the chain of standalone checkpoints on `store`:
+/// - v0: protocol and metadata;
+/// - v1: a manifest commit whose tree lists `a`, `b`, and the tree file `t`;
+/// - v2: an add of `c`, a remove of `t`, and txn `app` at 1; then standalone checkpoint S1;
+/// - v3: an add of `d` and a remove of `c`, which is an inline add of S1;
+/// - v4: txn `app` at 2.
+///
+/// Before the standalone checkpoint S2 at v4 is written, the commits at or below S1 are deleted
+/// when `cleanup` is set, as a table cleaner would.
+fn standalone_chain_table(store: Arc<InMemory>, cleanup: bool) -> SyncEngine {
+    let engine = SyncEngine::new_with_store(store.clone());
+    create_adaptive_metadata_table(&engine, &table_root(), &[]);
+    commit_root_manifest(
+        &engine,
+        &table_root(),
+        "metadata/root-1.parquet",
+        &[
+            added_data_entry("a.parquet", 1, 1, 0, 0),
+            added_data_entry("b.parquet", 1, 1, 1, 0),
+            added_data_entry("t.parquet", 1, 1, 2, 0),
+        ],
+    );
+    write_raw_commit(
+        &engine,
+        2,
+        &[
+            add_line("c.parquet"),
+            remove_line("t.parquet"),
+            txn_line("app", 1),
+        ],
+    );
+    snapshot_at(&engine, 2).checkpoint(&engine, None).unwrap();
+    write_raw_commit(
+        &engine,
+        3,
+        &[add_line("d.parquet"), remove_line("c.parquet")],
+    );
+    write_raw_commit(&engine, 4, &[txn_line("app", 2)]);
+
+    if cleanup {
+        for version in 0..=2 {
+            let path = delta_path_for_version(version, "json");
+            block_on(store.delete(&path)).unwrap();
+        }
+    }
+    snapshot_at(&engine, 4).checkpoint(&engine, None).unwrap();
+    engine
+}
+
+#[rstest]
+#[case::commits_at_or_below_standalone_kept(false)]
+#[case::commits_at_or_below_standalone_cleaned_up(true)]
+fn standalone_checkpoint_chains_into_next_standalone_checkpoint(#[case] cleanup: bool) {
+    let engine = standalone_chain_table(Arc::new(InMemory::new()), cleanup);
+    let snapshot = snapshot_at(&engine, 4);
+
+    // Reloaded from storage, the latest action is the one in S2's file.
+    let (action, source) = snapshot
+        .latest_checkpoint_action_with_source(&engine)
+        .unwrap()
+        .unwrap();
+    assert_eq!(action.version(), 4);
+    let CheckpointActionSource::Standalone { file, .. } = source else {
+        panic!("latest checkpoint action is not read from a standalone file");
+    };
+    assert_eq!(file.version, 4);
+    // S2's inline rows cover (R, S2]: the window's adds, and removes that survive reconciliation.
+    assert_eq!(
+        inline_paths(&engine, &snapshot),
+        (
+            strings(&["d.parquet"]),
+            strings(&["c.parquet", "t.parquet"])
+        )
+    );
+    let app_versions = snapshot.get_app_id_versions(&engine).unwrap();
+    assert_eq!(app_versions.get("app").map(|txn| txn.version), Some(2));
+    assert_eq!(
+        scan_paths(&engine, snapshot),
+        strings(&["a.parquet", "b.parquet", "d.parquet"])
+    );
+}
+
+#[test]
+fn standalone_chain_reuses_untouched_domain_metadata_sidecar() {
+    let (engine, table_root) = setup_adaptive_metadata_table();
+    let root_path = "metadata/root-1.parquet";
+    let root = write_manifest(
+        &engine,
+        table_root.join(root_path).unwrap(),
+        &[added_data_entry("a.parquet", 1, 1, 0, 0)],
+    );
+    let dm_sidecar = write_sidecar(
+        &engine,
+        &table_root,
+        "dms.parquet",
+        LOG_DOMAIN_METADATA_SCHEMA.clone(),
+        vec![DomainMetadata::new("user.sidecar".to_string(), "cfg".to_string()).into()],
+    );
+    let mut checkpoint = checkpoint_action_with_root(root_path, root.size as i64, 1).unwrap();
+    checkpoint.domain_metadata_sidecars = vec![dm_sidecar.clone()];
+    write_manifest_commit_keeping_pm(&engine, &table_root, 1, checkpoint).unwrap();
+    write_raw_commit(&engine, 2, &[add_line("b.parquet")]);
+    snapshot_at(&engine, 2).checkpoint(&engine, None).unwrap();
+    write_raw_commit(&engine, 3, &[add_line("c.parquet")]);
+    snapshot_at(&engine, 3).checkpoint(&engine, None).unwrap();
+
+    let action = snapshot_at(&engine, 3)
+        .latest_checkpoint_action(&engine)
+        .unwrap()
+        .unwrap();
+    assert_eq!(action.version(), 3);
+    assert_eq!(action.domain_metadata_sidecars, vec![dm_sidecar]);
 }

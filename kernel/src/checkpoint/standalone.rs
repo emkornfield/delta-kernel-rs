@@ -21,28 +21,34 @@ use crate::action_reconciliation::log_replay::{
 use crate::action_reconciliation::{ActionReconciliationIterator, merge_txns_and_domain_metadata};
 use crate::actions::set_transaction::scan_application_transactions;
 use crate::actions::{CheckpointAction, LOG_DOMAIN_METADATA_SCHEMA, LOG_TXN_SCHEMA};
-use crate::content_tree::read_checkpoint_action;
+use crate::content_tree::{read_checkpoint_action, read_standalone_checkpoint_file_actions};
 use crate::engine_data::FilteredEngineData;
-use crate::log_replay::HasSelectionVector;
-use crate::log_segment::scan_domain_metadata_actions;
-use crate::path::LogRoot;
+use crate::log_replay::{ActionsBatch, HasSelectionVector};
+use crate::log_segment::{CheckpointActionSource, scan_domain_metadata_actions};
+use crate::path::{LogRoot, ParsedLogPath};
 use crate::schema::SchemaRef;
 use crate::snapshot::SnapshotRef;
-use crate::{Engine, KernelError, KernelResult, KernelResultIterator, Version, version_as_i64};
+use crate::{
+    Engine, FileMeta, KernelError, KernelResult, KernelResultIterator, Version, version_as_i64,
+};
 
-/// Returns the output schema and the reconciled file actions of the commits in
-/// `(action.contentRoot.version, n]`, where `snapshot` is at version n and `action` is its latest
-/// checkpoint action. The batches are in the output schema, so they can be chained with the
-/// standalone checkpoint's other rows.
+/// Returns the output schema and the reconciled file actions of the window `(contentRoot.version,
+/// n]`, where `snapshot` is at version n and `action` is the standalone checkpoint's action at n.
+/// The batches are in the output schema, so they can be chained with the standalone checkpoint's
+/// other rows.
+///
+/// When `snapshot` lists the standalone checkpoint that its latest checkpoint action comes from,
+/// that checkpoint's inline file actions cover the start of the window, and only the commits after
+/// it are read.
 ///
 /// Every remove in the window is kept, including removes that cancel an add in the window. Adds
 /// and removes are copied verbatim.
 ///
 /// # Errors
 ///
-/// Returns an error if `snapshot` was checkpointed by a standalone checkpoint, whose inline file
-/// actions are not yet carried into the window, or if the table writes collation-aware stats as a
-/// struct.
+/// Returns an error if `snapshot` lists a checkpoint at or after its latest checkpoint action's
+/// version that is not a standalone checkpoint at that version, or if the table writes
+/// collation-aware stats as a struct.
 pub(super) fn gap_file_actions(
     snapshot: &SnapshotRef,
     engine: &dyn Engine,
@@ -51,7 +57,7 @@ pub(super) fn gap_file_actions(
     SchemaRef,
     impl KernelResultIterator<ActionReconciliationBatch> + use<>,
 )> {
-    ensure_listed_checkpoint_below(snapshot, action)?;
+    let predecessor = listed_predecessor(snapshot, engine)?;
     let window_start = non_negative_version(action.content_root_version(), "Content root version")?;
 
     let mut context = CheckpointWriter::checkpoint_schema_context(snapshot, engine)?;
@@ -73,9 +79,14 @@ pub(super) fn gap_file_actions(
     let (output_schema, evaluator) =
         checkpoint_output_transform(engine, &context, &read_schema, &context.stats_schema)?;
 
+    // Commits at or below the predecessor may be cleaned up, and its inline rows already cover
+    // them.
+    let commits_after = predecessor
+        .as_ref()
+        .map_or(window_start, |file| file.version);
     // TODO: log compaction files spanning the content root version must not feed this window.
     // Compaction is disabled (#2337).
-    let window = snapshot.log_segment().segment_after_version(window_start);
+    let window = snapshot.log_segment().segment_after_version(commits_after);
     // TODO: fail when reconciliation drops a backReference: a re-add without one after a remove
     // with one, or a remove without one after an add with one. Checking it needs backReference
     // columns and per-key state in the visitor.
@@ -85,7 +96,14 @@ pub(super) fn gap_file_actions(
         snapshot.table_configuration().dv_normalization_root(),
     )
     .with_file_actions_only();
-    let actions = window.read_actions(engine, read_schema)?;
+    // Newest first: the commits after the predecessor, then the rows the predecessor holds.
+    let inline: Box<dyn KernelResultIterator<ActionsBatch>> = match &predecessor {
+        Some(file) => {
+            read_standalone_checkpoint_file_actions(engine, &file.location, read_schema.clone())?
+        }
+        None => Box::new(iter::empty()),
+    };
+    let actions = window.read_actions(engine, read_schema)?.chain(inline);
     let reconciled = actions
         .map(move |batch| processor.process_actions_batch(batch?))
         .filter_ok(HasSelectionVector::has_selected_rows);
@@ -124,13 +142,16 @@ pub(super) fn standalone_checkpoint_data(
 ///
 /// # Errors
 ///
-/// Returns an error if `snapshot` has a listed checkpoint file at or after `base`'s version.
+/// Returns an error if `snapshot` lists a checkpoint at or after `base`'s version that is not a
+/// standalone checkpoint at that version.
 pub(super) fn compute_standalone_non_file_state(
     snapshot: &SnapshotRef,
     engine: &dyn Engine,
     base: &CheckpointAction,
 ) -> KernelResult<CheckpointAction> {
-    ensure_listed_checkpoint_below(snapshot, base)?;
+    // The predecessor's file actions are gap_file_actions' concern. Here the listed checkpoint
+    // only has to be one whose state `base` carries.
+    listed_predecessor(snapshot, engine)?;
     let base_version = non_negative_version(base.version(), "Checkpoint version")?;
 
     let window = snapshot.log_segment().segment_after_version(base_version);
@@ -190,23 +211,40 @@ pub(super) fn compute_standalone_non_file_state(
     })
 }
 
-/// Errors if `snapshot`'s listed checkpoint file is at or after `action`'s version. The windows
-/// that start at `action` would miss that file's inline actions.
-fn ensure_listed_checkpoint_below(
+/// Returns the listed standalone checkpoint file that `snapshot`'s latest checkpoint action is read
+/// from, or `None` when `snapshot` lists no checkpoint at or after that action's version.
+///
+/// That file holds the inline file actions of `(contentRoot.version, action.version]`, so a window
+/// starting at the action reads it and no commit at or below its version.
+///
+/// # Errors
+///
+/// Returns an error if `snapshot` lists a checkpoint at or after the latest checkpoint action's
+/// version that is not a standalone checkpoint at that version.
+fn listed_predecessor(
     snapshot: &SnapshotRef,
-    action: &CheckpointAction,
-) -> KernelResult<()> {
-    // TODO: lift once a standalone predecessor's inline actions are carried into the windows.
-    if let Some(standalone_version) = snapshot.log_segment().checkpoint_version
-        && version_as_i64(standalone_version)? >= action.version
-    {
-        return Err(KernelError::unsupported(format!(
-            "Checkpointing past the listed checkpoint at version {standalone_version} is not yet \
-             supported; the latest checkpoint action's version is {}",
-            action.version
-        )));
+    engine: &dyn Engine,
+) -> KernelResult<Option<ParsedLogPath<FileMeta>>> {
+    let Some((base, source)) = snapshot.latest_checkpoint_action_with_source(engine)? else {
+        return Ok(None);
+    };
+    let Some(listed_version) = snapshot.log_segment().checkpoint_version else {
+        return Ok(None);
+    };
+    if version_as_i64(listed_version)? < base.version() {
+        return Ok(None);
     }
-    Ok(())
+    match source {
+        CheckpointActionSource::Standalone { file, .. } if file.version == listed_version => {
+            Ok(Some(file))
+        }
+        _ => Err(KernelError::unsupported(format!(
+            "cannot write a standalone checkpoint: the listed checkpoint at version \
+             {listed_version} is not the standalone checkpoint of the latest checkpoint action \
+             (version {})",
+            base.version()
+        ))),
+    }
 }
 
 /// Converts a version read from a checkpoint action, naming `what` in the error.
@@ -300,10 +338,10 @@ mod tests {
         (engine, table_root)
     }
 
-    /// A snapshot at version 3 whose listed checkpoint at version 2 stands in for a standalone
-    /// predecessor. The manifest commit at [`MANIFEST_VERSION`] is the latest checkpoint action
-    /// the windows would start from.
-    fn snapshot_after_standalone_predecessor() -> (SyncEngine, SnapshotRef) {
+    /// A snapshot at version 3 whose listed classic checkpoint at version 2 has no content root.
+    /// The manifest commit at [`MANIFEST_VERSION`] is the latest checkpoint action the windows
+    /// would start from.
+    fn snapshot_after_classic_predecessor() -> (SyncEngine, SnapshotRef) {
         let (engine, table_root) = setup_manifest_commit(true);
         let checkpoint_path = ParsedLogPath::new_classic_parquet_checkpoint(&table_root, 2)
             .unwrap()
@@ -333,10 +371,10 @@ mod tests {
         (engine, snapshot)
     }
 
-    fn assert_standalone_predecessor_error(err: &KernelError) {
+    fn assert_classic_predecessor_error(err: &KernelError) {
         let message = err.to_string();
         assert!(
-            message.contains("version 2") && message.contains("version is 1"),
+            message.contains("version 2") && message.contains("version 1"),
             "unexpected error: {message}"
         );
     }
@@ -486,11 +524,49 @@ mod tests {
     }
 
     #[test]
-    fn gap_file_actions_rejects_standalone_predecessor() {
-        let (engine, snapshot) = snapshot_after_standalone_predecessor();
+    fn gap_file_actions_rejects_classic_predecessor() {
+        let (engine, snapshot) = snapshot_after_classic_predecessor();
         let action = minimal_checkpoint_action("metadata/root.parquet", MANIFEST_VERSION).unwrap();
         let err = gap_file_actions(&snapshot, &engine, &action).err().unwrap();
-        assert_standalone_predecessor_error(&err);
+        assert_classic_predecessor_error(&err);
+    }
+
+    #[test]
+    fn gap_file_actions_reads_commits_after_standalone_predecessor() {
+        let (engine, table_root) = setup_manifest_commit(true);
+        write_commit_after_manifest_commit(
+            &engine,
+            &table_root,
+            MANIFEST_VERSION + 1,
+            MANIFEST_VERSION,
+            commit_data(&[add("a")]),
+        )
+        .unwrap();
+        write_commit_after_manifest_commit(
+            &engine,
+            &table_root,
+            MANIFEST_VERSION + 2,
+            MANIFEST_VERSION,
+            commit_data(&[add("b")]),
+        )
+        .unwrap();
+        let predecessor_version = MANIFEST_VERSION + 2;
+        let snapshot = Snapshot::builder_for(table_root.clone())
+            .build(&engine)
+            .unwrap();
+        snapshot.checkpoint(&engine, None).unwrap();
+        write_commit_after_manifest_commit(
+            &engine,
+            &table_root,
+            predecessor_version + 1,
+            MANIFEST_VERSION,
+            commit_data(&[remove("a"), add("c")]),
+        )
+        .unwrap();
+
+        let (adds, removes) = gap_paths(&engine, &table_root, predecessor_version + 1);
+        assert_eq!(adds, strings(&["b", "c"]));
+        assert_eq!(removes, strings(&["a"]));
     }
 
     fn dm(domain: &str, removed: bool) -> String {
@@ -683,12 +759,12 @@ mod tests {
     }
 
     #[test]
-    fn non_file_state_rejects_standalone_predecessor() {
-        let (engine, snapshot) = snapshot_after_standalone_predecessor();
+    fn non_file_state_rejects_classic_predecessor() {
+        let (engine, snapshot) = snapshot_after_classic_predecessor();
         let action = minimal_checkpoint_action("metadata/root.parquet", MANIFEST_VERSION).unwrap();
         let err = compute_standalone_non_file_state(&snapshot, &engine, &action)
             .err()
             .unwrap();
-        assert_standalone_predecessor_error(&err);
+        assert_classic_predecessor_error(&err);
     }
 }
