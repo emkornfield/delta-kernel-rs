@@ -933,17 +933,14 @@ async fn replay_skips_commits_below_pointed_content_root() {
 }
 
 // The pointed manifest commit is newer than the segment's checkpoint, but its content root is not.
-// The non-plan replay reads the whole segment and captures the pointed action. A plan replay
-// bounded by a checkpoint file reads only the newest commit's action, so the snapshot follows the
-// pointer to the pointed one.
+// The pointed action is not newer than that checkpoint, so replay does not capture it and the
+// snapshot follows the pointer to it.
 #[tokio::test]
 async fn replay_resolves_pointed_action_above_segment_checkpoint() {
-    check_pointed_action_above_segment_checkpoint(non_plan_engine, Some(1), resolved_pointer(2, 1))
-        .await;
+    check_pointed_action_above_segment_checkpoint(non_plan_engine, resolved_pointer(2, 1)).await;
     #[cfg(feature = "declarative-plans")]
     check_pointed_action_above_segment_checkpoint(
         |store| SyncEngine::new_with_store(store),
-        None,
         resolved_pointer(2, 1),
     )
     .await;
@@ -951,7 +948,6 @@ async fn replay_resolves_pointed_action_above_segment_checkpoint() {
 
 async fn check_pointed_action_above_segment_checkpoint<E: Engine>(
     make_engine: impl FnOnce(Arc<InMemory>) -> E,
-    expected_captured_version: Option<i64>,
     expected_last_manifest_commit: LastManifestCommitResolution,
 ) {
     let (store, table_root) = manifest_commit_table(&[
@@ -969,11 +965,7 @@ async fn check_pointed_action_above_segment_checkpoint<E: Engine>(
         .read_protocol_metadata_opt(&engine, None)
         .unwrap();
     assert!(resolution.protocol.is_some() && resolution.metadata.is_some());
-    assert_resolved_pointer(
-        resolution,
-        &expected_last_manifest_commit,
-        expected_captured_version,
-    );
+    assert_resolved_pointer(resolution, &expected_last_manifest_commit, None);
 }
 
 // A plan-path engine over `store` that records into `plans` the log versions each plan scans.
@@ -1019,14 +1011,21 @@ impl PlanExecutor for RecordingPlanExecutor {
 
 // A standalone checkpoint written after the manifest commit hides that commit from the segment.
 // Replay still resolves P&M from the checkpoint and the newest commit's pointer without reading the
-// pointed commit, which is deleted here. The action is read from the checkpoint file instead.
+// pointed commit, which is deleted here. The imperative replay drains the checkpoint file and
+// captures its action; the plan path does not capture, so the lookup reads the file.
 #[tokio::test]
 async fn standalone_checkpoint_above_pointed_commit_resolves_its_action() {
-    check_standalone_checkpoint_above_pointed_commit(non_plan_engine, resolved_pointer(0, 0)).await;
+    check_standalone_checkpoint_above_pointed_commit(
+        non_plan_engine,
+        resolved_pointer(0, 0),
+        Some(1),
+    )
+    .await;
     #[cfg(feature = "declarative-plans")]
     check_standalone_checkpoint_above_pointed_commit(
         |store| SyncEngine::new_with_store(store),
         resolved_pointer(0, 0),
+        None,
     )
     .await;
 }
@@ -1034,6 +1033,7 @@ async fn standalone_checkpoint_above_pointed_commit_resolves_its_action() {
 async fn check_standalone_checkpoint_above_pointed_commit<E: Engine>(
     make_engine: impl FnOnce(Arc<InMemory>) -> E,
     expected_last_manifest_commit: LastManifestCommitResolution,
+    captured_version: Option<i64>,
 ) {
     let pointer = commit_info(Some((0, 0)));
     let (store, table_root) = manifest_commit_table(&[pointer.clone(), pointer]).await;
@@ -1050,7 +1050,7 @@ async fn check_standalone_checkpoint_above_pointed_commit<E: Engine>(
         .read_protocol_metadata_opt(&engine, None)
         .unwrap();
     assert!(resolution.protocol.is_some() && resolution.metadata.is_some());
-    assert_resolved_pointer(resolution, &expected_last_manifest_commit, None);
+    assert_resolved_pointer(resolution, &expected_last_manifest_commit, captured_version);
 
     let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
     let action = snapshot.latest_checkpoint_action(&engine).unwrap().unwrap();

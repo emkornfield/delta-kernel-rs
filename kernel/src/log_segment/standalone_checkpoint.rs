@@ -8,7 +8,7 @@ use crate::actions::{
 };
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::utils::require;
-use crate::{Engine, FileMeta, KernelError, KernelResult, RowVisitor, version_as_i64};
+use crate::{Engine, FileMeta, KernelError, KernelResult, RowVisitor, Version, version_as_i64};
 
 impl LogSegment {
     /// The listed checkpoint file when it is a standalone adaptiveMetadata checkpoint, or `None`
@@ -54,14 +54,23 @@ pub(crate) fn read_standalone_checkpoint_action(
         visitor.visit_rows_of(batch?.as_ref())?;
     }
     let source = format!("standalone checkpoint {}", file.location.location);
-    let action = visitor.into_checkpoint_action(&source)?;
+    assemble_standalone_checkpoint_action(visitor, file.version, &source)
+}
 
-    let file_version = version_as_i64(file.version)?;
+/// Assembles the checkpoint action from the element rows `visitor` saw in the standalone
+/// checkpoint file at `file_version`. `source` names the file in error messages.
+pub(super) fn assemble_standalone_checkpoint_action(
+    visitor: CheckpointElementVisitor,
+    file_version: Version,
+    source: &str,
+) -> KernelResult<CheckpointAction> {
+    let action = visitor.into_checkpoint_action(source)?;
+    let file_version_i64 = version_as_i64(file_version)?;
     require!(
-        action.version == file_version,
+        action.version == file_version_i64,
         KernelError::generic(format!(
             "{source} has checkpointMetadata.version {}, expected the file's version \
-             {file_version}",
+             {file_version_i64}",
             action.version
         ))
     );
@@ -115,12 +124,15 @@ mod tests {
     use crate::object_store::memory::InMemory;
     use crate::snapshot::{CheckpointWriteResult, Snapshot};
     use crate::unit_test_utils::adaptive_metadata_fixtures::{
-        commit_info_line, last_manifest_commit_info, minimal_checkpoint_action, reader_engine,
-        setup_adaptive_metadata_table, setup_table, setup_table_on, standalone_checkpoint_rows,
-        write_commit, write_commit_after_manifest_commit, write_manifest_commit, write_sidecar,
+        commit_info_line, last_manifest_commit_info, minimal_checkpoint_action,
+        protocol_and_metadata_lines, reader_engine, setup_adaptive_metadata_table, setup_table,
+        setup_table_on, standalone_checkpoint_rows, write_commit,
+        write_commit_after_manifest_commit, write_manifest_commit, write_sidecar,
         write_standalone_checkpoint_batches,
     };
-    use crate::unit_test_utils::{assert_result_error_with_message, parse_json_batch};
+    use crate::unit_test_utils::{
+        assert_result_error_with_message, parse_json_batch, test_schema_flat_with_column_mapping,
+    };
     use crate::{Result, Version};
 
     /// The `ParsedLogPath` of the standalone checkpoint file at `version` of `table_root`.
@@ -428,6 +440,154 @@ mod tests {
 
         let reader = reader_engine(store, plan_executor);
         let snapshot = Snapshot::builder_for(table_root).build(reader.as_ref())?;
+        assert_result_error_with_message(
+            snapshot.latest_checkpoint_action(reader.as_ref()),
+            "standalone checkpoint at version 2 has contentRoot.version 1, but lastManifestCommit \
+             (manifest commit version 1) has contentRootVersion 0",
+        );
+        Ok(())
+    }
+
+    /// P&M replay drains the standalone file it has to read for P&M, so the build keeps the file's
+    /// checkpoint action. Deleting the file afterwards shows the lookup does not read it again.
+    #[tokio::test]
+    async fn snapshot_build_captures_standalone_checkpoint_action() -> Result<()> {
+        let store = Arc::new(InMemory::new());
+        let (engine, table_root, written) = write_checkpointed_table(store.clone())?;
+        write_txn_commit_after_manifest_commit(&engine, &table_root, 3)?;
+
+        // Only the imperative path captures. The plan path does not yet.
+        let reader = reader_engine(store.clone(), false);
+        let snapshot = Snapshot::builder_for(table_root).build(reader.as_ref())?;
+        assert_eq!(snapshot.log_segment().checkpoint_version, Some(2));
+        store
+            .delete(&delta_path_for_version(2, "checkpoint.parquet"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            snapshot.latest_checkpoint_action(reader.as_ref())?,
+            Some(written)
+        );
+        Ok(())
+    }
+
+    /// A commit above the standalone file that carries Protocol and Metadata ends P&M replay before
+    /// the file, so nothing is captured and the lookup reads the file.
+    #[rstest]
+    #[tokio::test]
+    async fn short_circuited_replay_leaves_standalone_action_uncaptured(
+        #[values(false, true)] plan_executor: bool,
+    ) -> Result<()> {
+        let store = Arc::new(InMemory::new());
+        let (engine, table_root, written) = write_checkpointed_table(store.clone())?;
+        let pm = protocol_and_metadata_lines(test_schema_flat_with_column_mapping(), &[]);
+        let mut lines: Vec<String> = pm.lines().map(String::from).collect();
+        lines.push(last_manifest_commit_info(1, 1).to_string());
+        write_commit(
+            &engine,
+            &table_root,
+            3,
+            parse_json_batch(StringArray::from(lines)),
+        )?;
+
+        let reader = reader_engine(store, plan_executor);
+        let snapshot = Snapshot::builder_for(table_root).build(reader.as_ref())?;
+        assert_eq!(snapshot.log_segment().checkpoint_version, Some(2));
+        let resolution = snapshot
+            .log_segment()
+            .read_protocol_metadata_opt(reader.as_ref(), None)?;
+        assert!(resolution.captured_checkpoint_action.is_none());
+        assert_eq!(
+            snapshot.latest_checkpoint_action(reader.as_ref())?,
+            Some(written)
+        );
+        Ok(())
+    }
+
+    /// A standalone file whose rows fail to assemble is read to its end for its capture, once P&M
+    /// is final at its first batch. The failure drops the capture, and the lookup reports it.
+    #[rstest]
+    fn standalone_drain_failure_leaves_action_uncaptured(
+        #[values(false, true)] plan_executor: bool,
+    ) -> Result<()> {
+        let store = Arc::new(InMemory::new());
+        let (engine, table_root) = setup_table_on(store.clone())?;
+        write_manifest_commit(
+            &engine,
+            &table_root,
+            1,
+            minimal_checkpoint_action("metadata/root.parquet", 1)?,
+        )?;
+        write_commit(
+            &engine,
+            &table_root,
+            2,
+            parse_json_batch(StringArray::from(vec![
+                last_manifest_commit_info(1, 1).to_string(),
+            ])),
+        )?;
+        // The first batch holds Protocol and Metadata, so P&M is final there. The second repeats
+        // the contentRoot row, which fails to assemble.
+        let duplicate_content_root = json!({ "contentRoot": {
+            "path": "metadata/root.parquet", "sizeInBytes": 1024, "version": 1,
+        } });
+        write_standalone_checkpoint_batches(
+            &engine,
+            &table_root,
+            2,
+            vec![
+                standalone_checkpoint_rows(2, 1),
+                vec![duplicate_content_root],
+            ],
+        )?;
+        // A commit without Protocol and Metadata keeps P&M replay reading into the file.
+        write_commit(
+            &engine,
+            &table_root,
+            3,
+            parse_json_batch(StringArray::from(vec![
+                last_manifest_commit_info(1, 1).to_string(),
+            ])),
+        )?;
+
+        let reader = reader_engine(store, plan_executor);
+        let snapshot = Snapshot::builder_for(table_root).build(reader.as_ref())?;
+        let resolution = snapshot
+            .log_segment()
+            .read_protocol_metadata_opt(reader.as_ref(), None)?;
+        assert!(resolution.captured_checkpoint_action.is_none());
+        assert_result_error_with_message(
+            snapshot.latest_checkpoint_action(reader.as_ref()),
+            "has 2 `contentRoot` elements",
+        );
+        Ok(())
+    }
+
+    /// A captured standalone action whose content root differs from the pointer's is not used.
+    /// The lookup then reports the mismatch from the file.
+    #[rstest]
+    fn standalone_capture_failing_pointer_check_is_not_used(
+        #[values(false, true)] plan_executor: bool,
+    ) -> Result<()> {
+        let store = Arc::new(InMemory::new());
+        let (engine, table_root, _) = write_checkpointed_table(store.clone())?;
+        // The pointer says content root 0, but the standalone file at 2 has content root 1.
+        write_commit(
+            &engine,
+            &table_root,
+            3,
+            parse_json_batch(StringArray::from(vec![
+                last_manifest_commit_info(1, 0).to_string(),
+            ])),
+        )?;
+
+        let reader = reader_engine(store, plan_executor);
+        let snapshot = Snapshot::builder_for(table_root).build(reader.as_ref())?;
+        let resolution = snapshot
+            .log_segment()
+            .read_protocol_metadata_opt(reader.as_ref(), None)?;
+        assert!(resolution.captured_checkpoint_action.is_none());
         assert_result_error_with_message(
             snapshot.latest_checkpoint_action(reader.as_ref()),
             "standalone checkpoint at version 2 has contentRoot.version 1, but lastManifestCommit \
