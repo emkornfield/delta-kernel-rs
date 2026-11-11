@@ -2,6 +2,8 @@
 //! files.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use std::fmt::Display;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use std::iter;
 use std::num::NonZero;
 use std::sync::{Arc, LazyLock};
 
@@ -26,7 +28,7 @@ use crate::checkpoint::collation_stats::{
 };
 use crate::committer::CatalogCommit;
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::content_tree::read_checkpoint_action;
+use crate::content_tree::{read_checkpoint_action, read_standalone_checkpoint_file_actions};
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint};
 use crate::log_replay::ActionsBatch;
@@ -278,7 +280,7 @@ fn action_presence_witness(action_name: &str) -> Option<ColumnName> {
 /// Each requested action contributes an `IS NOT NULL` presence witness, and the witnesses are
 /// joined with `OR`. Returns `None` if the schema is empty, or if any field lacks a reliable
 /// witness (an action that could occupy a row group the resulting predicate would otherwise skip).
-fn checkpoint_action_projection_predicate(schema: &StructType) -> Option<PredicateRef> {
+pub(crate) fn checkpoint_action_projection_predicate(schema: &StructType) -> Option<PredicateRef> {
     let columns: Vec<ColumnName> = schema
         .fields()
         .map(|field| action_presence_witness(field.name()))
@@ -995,7 +997,10 @@ impl LogSegment {
     /// Same as [`Self::read_actions_with_projected_checkpoint_actions`], but reads the AMT
     /// `checkpoint` action as the segment's checkpoint: the commits after its version are followed
     /// by the actions it carries, and the commits and checkpoint files at or below that version are
-    /// not read.
+    /// not read. `source` is where the action was read from, and selects its guards.
+    ///
+    /// A standalone checkpoint's inline `add` and `remove` rows are read with `commit_read_schema`
+    /// and follow the commits. Its tree adds come last, so the inline removes cancel them.
     ///
     /// `table_root` resolves the action's manifest locations.
     #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -1020,38 +1025,62 @@ impl LogSegment {
                     self.end_version
                 ))
             })?;
-        // A manifest commit's checkpoint action covers its version with the tree alone; an older
-        // root needs the inline file actions only a standalone checkpoint carries.
-        require!(
-            checkpoint.content_root_version() == checkpoint.version(),
-            KernelError::unsupported(format!(
-                "reading a checkpoint action whose content root version {} is older than its \
-                 version {version} is not yet supported",
-                checkpoint.content_root_version()
-            ))
-        );
-        match source {
+        let standalone_file = match source {
             CheckpointActionSource::ManifestCommit { .. } => {
-                // Writers stop producing checkpoint files once adaptiveMetadata is enabled, so a
-                // file at or after the action's version is a standalone checkpoint.
+                // A manifest commit's checkpoint action covers its version with the tree alone; an
+                // older root needs the inline file actions only a standalone checkpoint carries.
+                require!(
+                    checkpoint.content_root_version() == checkpoint.version(),
+                    KernelError::unsupported(format!(
+                        "reading a checkpoint action whose content root version {} is older than \
+                         its version {version} is not yet supported",
+                        checkpoint.content_root_version()
+                    ))
+                );
+                // The snapshot picks a listed standalone file at or after this version as the
+                // source instead, so seeing one here means the action and the segment disagree.
                 if let Some(checkpoint_file_version) =
                     self.checkpoint_version.filter(|v| *v >= version)
                 {
-                    return Err(KernelError::unsupported(format!(
-                        "reading the adaptiveMetadata standalone checkpoint at version \
-                         {checkpoint_file_version} is not yet supported"
+                    return Err(KernelError::invalid_log_segment(format!(
+                        "checkpoint file at version {checkpoint_file_version} is at or after the \
+                         checkpoint action at version {version}, which is read from its manifest \
+                         commit"
                     )));
                 }
+                None
             }
             CheckpointActionSource::Standalone { file, .. } => {
-                return Err(KernelError::unsupported(format!(
-                    "reading the adaptiveMetadata standalone checkpoint at version {} is not yet \
-                     supported",
-                    file.version
-                )));
+                require!(
+                    checkpoint.content_root_version() <= checkpoint.version(),
+                    KernelError::invalid_checkpoint(format!(
+                        "checkpoint action at version {} has content root version {}, which is \
+                         newer than its version",
+                        checkpoint.version(),
+                        checkpoint.content_root_version()
+                    ))
+                );
+                require!(
+                    file.version == version,
+                    KernelError::invalid_log_segment(format!(
+                        "standalone checkpoint file at version {} does not match the checkpoint \
+                         action at version {version}",
+                        file.version
+                    ))
+                );
+                Some(file)
             }
-        }
+        };
 
+        // Inline rows are log-shaped, so they read with the commit schema like the commits do.
+        let file_actions: Box<dyn KernelResultIterator<ActionsBatch>> = match standalone_file {
+            Some(file) => read_standalone_checkpoint_file_actions(
+                engine,
+                &file.location,
+                commit_read_schema.clone(),
+            )?,
+            None => Box::new(iter::empty()),
+        };
         let commits = Self::read_commit_files(
             engine,
             &self.find_commit_cover_after(Some(version)),
@@ -1072,7 +1101,7 @@ impl LogSegment {
             checkpoint_read_schema.clone(),
         )?;
         Ok(ActionsWithCheckpointInfo {
-            actions: Box::new(commits.chain(checkpoint_actions)),
+            actions: Box::new(commits.chain(file_actions).chain(checkpoint_actions)),
             // TODO(#2866): the content tree reader produces neither `stats_parsed` nor
             // `partitionValues_parsed`, so replay parses the JSON stats.
             checkpoint_info: CheckpointReadInfo {

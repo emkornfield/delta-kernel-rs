@@ -1,21 +1,23 @@
 //! Log-replay batches read from an adaptiveMetadata (AMT) `checkpoint` action.
 
 use std::iter;
+use std::sync::LazyLock;
 
 use super::action_projector::ActionProjector;
 use super::checkpoint_sidecar::read_sidecar_actions;
 use super::reader::{ReadContext, read_add_actions_from_amt};
 use crate::actions::{
-    ADD_NAME, CheckpointAction, DOMAIN_METADATA_NAME, LOG_ADD_SCHEMA, LOG_DOMAIN_METADATA_SCHEMA,
-    LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA, LOG_TXN_SCHEMA, METADATA_NAME, PROTOCOL_NAME,
-    REMOVE_NAME, SET_TRANSACTION_NAME, Sidecar,
+    ADD_FIELD, ADD_NAME, CheckpointAction, DOMAIN_METADATA_NAME, LOG_ADD_SCHEMA,
+    LOG_DOMAIN_METADATA_SCHEMA, LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA, LOG_TXN_SCHEMA,
+    METADATA_NAME, PROTOCOL_NAME, REMOVE_FIELD, REMOVE_NAME, SET_TRANSACTION_NAME, Sidecar,
 };
 use crate::expressions::Scalar;
 use crate::log_replay::ActionsBatch;
+use crate::log_segment::checkpoint_action_projection_predicate;
 use crate::path::LogRoot;
-use crate::schema::SchemaRef;
+use crate::schema::{SchemaRef, lazy_schema_ref};
 use crate::utils::require;
-use crate::{Engine, KernelError, KernelResult, KernelResultIterator};
+use crate::{Engine, FileMeta, KernelError, KernelResult, KernelResultIterator};
 
 /// The action kinds a read schema may ask a checkpoint action for.
 const CHECKPOINT_ACTION_KINDS: &[&str] = &[
@@ -96,6 +98,43 @@ pub(crate) fn read_checkpoint_action(
     Ok(Box::new(streams.into_iter().flatten()))
 }
 
+/// The commit-shaped `add` and `remove` actions. Inline standalone rows are read with these
+/// schemas, not the checkpoint read schema, whose `add` has columns the file does not hold.
+static LOG_FILE_ACTIONS_SCHEMA: LazyLock<SchemaRef> =
+    lazy_schema_ref! { (&ADD_FIELD), (&REMOVE_FIELD) };
+
+/// Reads the `add` and `remove` rows inline in the standalone checkpoint file at `file`, projected
+/// onto `read_schema` as log batches (`is_log_batch = true`). Replay applies these removes to the
+/// tree adds that [`read_checkpoint_action`] returns after them.
+///
+/// The file's other rows are not read: the non-file actions come from the checkpoint action. Reads
+/// nothing when `read_schema` has neither `add` nor `remove`.
+pub(crate) fn read_standalone_checkpoint_file_actions(
+    engine: &dyn Engine,
+    file: &FileMeta,
+    read_schema: SchemaRef,
+) -> KernelResult<Box<dyn KernelResultIterator<ActionsBatch>>> {
+    let actions: Vec<&str> = [ADD_NAME, REMOVE_NAME]
+        .into_iter()
+        .filter(|action| read_schema.field(action).is_some())
+        .collect();
+    if actions.is_empty() {
+        return Ok(Box::new(iter::empty()));
+    }
+    let file_schema = LOG_FILE_ACTIONS_SCHEMA.project(&actions)?;
+    let predicate = checkpoint_action_projection_predicate(&file_schema);
+    let projector = ActionProjector::try_new(engine, &actions, file_schema.clone(), read_schema)?;
+    let data = engine.parquet_handler().read_parquet_files(
+        std::slice::from_ref(file),
+        file_schema,
+        predicate,
+    )?;
+    Ok(Box::new(data.map(move |batch| {
+        let batch = projector.project(batch?.as_ref())?;
+        Ok(ActionsBatch::new(batch, true))
+    })))
+}
+
 /// The `add` actions of `checkpoint`'s content tree, projected onto `read_schema`.
 fn read_tree_adds(
     engine: &dyn Engine,
@@ -120,7 +159,7 @@ fn read_tree_adds(
         data_change: false,
     };
     let projector =
-        ActionProjector::try_new(engine, ADD_NAME, LOG_ADD_SCHEMA.clone(), read_schema)?;
+        ActionProjector::try_new(engine, &[ADD_NAME], LOG_ADD_SCHEMA.clone(), read_schema)?;
     // The engine's handlers carry any cancellation token bound to this read.
     let adds = read_add_actions_from_amt(engine, checkpoint, &ctx, None)?;
     Ok(Box::new(adds.map(move |batch| {
@@ -147,7 +186,7 @@ fn inline_actions(
     if rows.is_empty() {
         return Ok(Box::new(iter::empty()));
     }
-    let projector = ActionProjector::try_new(engine, action, source.clone(), read_schema)?;
+    let projector = ActionProjector::try_new(engine, &[action], source.clone(), read_schema)?;
     let data = engine.evaluation_handler().create_many(source, rows)?;
     let batch = ActionsBatch::new(projector.project(data.as_ref())?, false);
     Ok(Box::new(iter::once(Ok(batch))))
@@ -201,8 +240,8 @@ mod tests {
         create_adaptive_metadata_table, write_sidecar,
     };
     use crate::unit_test_utils::{
-        Action, TestCancellationToken, assert_result_error_with_message, create_log_path_with_size,
-        test_schema_flat_with_column_mapping,
+        Action, TestCancellationToken, assert_result_error_with_message, create_log_path,
+        create_log_path_with_size, test_schema_flat_with_column_mapping,
     };
     use crate::{CancellationTokenRef, Version};
 
@@ -483,7 +522,7 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn checkpoint_file_at_or_after_checkpoint_action_is_unsupported(
+    async fn checkpoint_file_at_or_after_manifest_commit_action_is_invalid(
         #[values(TWO_ADDS_VERSION, TWO_ADDS_VERSION + 1)] file_version: Version,
     ) {
         let store = Arc::new(InMemory::new());
@@ -507,7 +546,10 @@ mod tests {
 
         assert_result_error_with_message(
             result,
-            &format!("standalone checkpoint at version {file_version} is not yet supported"),
+            &format!(
+                "checkpoint file at version {file_version} is at or after the checkpoint action at \
+                 version {TWO_ADDS_VERSION}, which is read from its manifest commit"
+            ),
         );
     }
 
@@ -535,6 +577,54 @@ mod tests {
             COMMIT_READ_SCHEMA.clone(),
             CHECKPOINT_READ_SCHEMA.clone(),
         );
+
+        assert_result_error_with_message(result, message);
+    }
+
+    #[rstest]
+    #[case::file_version_differs(
+        2,
+        2,
+        3,
+        "standalone checkpoint file at version 3 does not match the checkpoint action at version 2"
+    )]
+    #[case::content_root_newer_than_action(
+        2,
+        3,
+        2,
+        "checkpoint action at version 2 has content root version 3, which is newer than its version"
+    )]
+    fn standalone_source_rejects_mismatched_file_or_content_root(
+        #[case] version: Version,
+        #[case] content_root_version: i64,
+        #[case] file_version: Version,
+        #[case] message: &str,
+    ) {
+        let store = Arc::new(InMemory::new());
+        let engine = two_adds_then_add_and_remove(&store);
+        let checkpoint = CheckpointAction {
+            content_root: ContentRoot::new(ROOT_PATH.to_string(), 1, content_root_version),
+            ..checkpoint_action_with_root(ROOT_PATH, 1, version).unwrap()
+        };
+        let file = create_log_path(&format!(
+            "{TABLE_ROOT}_delta_log/{file_version:020}.checkpoint.parquet"
+        ));
+        let source = CheckpointActionSource::Standalone {
+            file,
+            pointer: None,
+        };
+
+        let result = latest_log_segment(&table_root(), &engine)
+            .read_actions_with_checkpoint_action(
+                &engine,
+                &checkpoint,
+                &source,
+                &table_root(),
+                COMMIT_READ_SCHEMA.clone(),
+                CHECKPOINT_READ_SCHEMA.clone(),
+                None,
+            )
+            .map(|_| ());
 
         assert_result_error_with_message(result, message);
     }

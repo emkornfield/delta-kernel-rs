@@ -107,7 +107,9 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::actions::Sidecar;
+    use crate::actions::{
+        DomainMetadata, LOG_DOMAIN_METADATA_SCHEMA, LOG_TXN_SCHEMA, SetTransaction, Sidecar,
+    };
     use crate::arrow::array::StringArray;
     use crate::engine::sync::SyncEngine;
     use crate::object_store::ObjectStoreExt as _;
@@ -116,7 +118,7 @@ mod tests {
     use crate::unit_test_utils::adaptive_metadata_fixtures::{
         last_manifest_commit_info, minimal_checkpoint_action, setup_adaptive_metadata_table,
         setup_table, setup_table_on, standalone_checkpoint_rows, write_commit,
-        write_commit_after_manifest_commit, write_manifest_commit,
+        write_commit_after_manifest_commit, write_manifest_commit, write_sidecar,
         write_standalone_checkpoint_batches,
     };
     use crate::unit_test_utils::{assert_result_error_with_message, parse_json_batch};
@@ -403,6 +405,67 @@ mod tests {
             Some(expected) => assert_result_error_with_message(result, expected),
             None => assert_eq!(result?.map(|action| action.version), Some(3)),
         }
+        Ok(())
+    }
+
+    /// Typed sidecars of a standalone checkpoint carry txn and domainMetadata entries, which the
+    /// snapshot reads alongside the inline ones, and are not read as file-action sidecars.
+    #[test]
+    fn txn_and_domain_metadata_come_from_inline_entries_and_sidecars() -> Result<()> {
+        let (engine, table_root) = setup_table()?;
+        write_manifest_commit(
+            &engine,
+            &table_root,
+            1,
+            minimal_checkpoint_action("metadata/root.parquet", 1)?,
+        )?;
+        write_commit_after_manifest_commit(
+            &engine,
+            &table_root,
+            2,
+            1,
+            parse_json_batch(StringArray::from(Vec::<String>::new())),
+        )?;
+        write_sidecar(
+            &engine,
+            &table_root,
+            "txn-sidecar.parquet",
+            LOG_TXN_SCHEMA.clone(),
+            vec![SetTransaction::new("spilled".to_string(), 3, None).into()],
+        );
+        write_sidecar(
+            &engine,
+            &table_root,
+            "dm-sidecar.parquet",
+            LOG_DOMAIN_METADATA_SCHEMA.clone(),
+            vec![DomainMetadata::new("user.spilled".to_string(), "cfg".to_string()).into()],
+        );
+        let mut rows = standalone_checkpoint_rows(2, 1);
+        rows.extend([
+            json!({ "txn": { "appId": "inline", "version": 1 } }),
+            json!({ "domainMetadata": { "domain": "user.inline", "configuration": "cfg",
+                                        "removed": false } }),
+            json!({ "sidecar": { "type": "txn", "path": "txn-sidecar.parquet",
+                                 "sizeInBytes": 100, "modificationTime": 1 } }),
+            json!({ "sidecar": { "type": "domainMetadata", "path": "dm-sidecar.parquet",
+                                 "sizeInBytes": 100, "modificationTime": 1 } }),
+        ]);
+        write_standalone_checkpoint_batches(&engine, &table_root, 2, vec![rows])?;
+
+        let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+
+        assert_eq!(snapshot.log_segment().checkpoint_version, Some(2));
+        let reader = snapshot.reader();
+        assert_eq!(reader.get_app_id_version("inline", &engine)?, Some(1));
+        assert_eq!(reader.get_app_id_version("spilled", &engine)?, Some(3));
+        assert_eq!(
+            reader.get_domain_metadata("user.inline", &engine)?,
+            Some("cfg".to_string())
+        );
+        assert_eq!(
+            reader.get_domain_metadata("user.spilled", &engine)?,
+            Some("cfg".to_string())
+        );
         Ok(())
     }
 

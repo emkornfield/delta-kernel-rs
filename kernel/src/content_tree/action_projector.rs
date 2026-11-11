@@ -7,9 +7,9 @@ use crate::expressions::{Expression, expr, null_lit};
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::{Engine, EngineData, ExpressionEvaluator, KernelError, KernelResult};
 
-/// Pads batches holding one top-level action out to a log-replay read schema, with every other
+/// Pads batches holding top-level actions out to a log-replay read schema, with every other
 /// top-level action null. Each source an adaptiveMetadata `checkpoint` action reads from yields
-/// batches of a single action kind.
+/// batches whose rows each hold one of the projected actions.
 ///
 /// For example, projecting `add` batches onto a read schema of `{add, remove}` keeps each row's
 /// `add` and makes its `remove` null.
@@ -19,47 +19,32 @@ pub(super) struct ActionProjector {
 
 impl ActionProjector {
     /// Builds a projector from `source`, the schema of the batches to project, onto `read_schema`.
-    /// Fields of `read_schema.<action>` that `source.<action>` has are copied; every other nullable
-    /// field is null. Only the action's top-level fields are matched, so a nested struct is copied
+    /// Each of `actions` must be a top-level struct in both schemas. Fields of
+    /// `read_schema.<action>` that `source.<action>` has are copied; every other nullable field
+    /// is null. Only the action's top-level fields are matched, so a nested struct is copied
     /// whole. A null source action stays null.
     ///
     /// For example, projecting `LOG_ADD_SCHEMA` batches onto a read schema whose `add` omits
     /// `stats` copies `add.path`, `add.size`, and the other shared fields, and drops `add.stats`.
     ///
     /// # Errors
-    /// Returns an error if `action` is not a struct in both schemas, if a field both have differs
+    /// Returns an error if an action is not a struct in both schemas, if a field both have differs
     /// in type, or if `read_schema` has a non-nullable field `source` cannot supply.
     pub(super) fn try_new(
         engine: &dyn Engine,
-        action: &str,
+        actions: &[&str],
         source: SchemaRef,
         read_schema: SchemaRef,
     ) -> KernelResult<Self> {
-        let source_fields = action_struct(&source, action)?;
-        let fields = action_struct(&read_schema, action)?
-            .fields()
-            .map(|field| {
-                let name = field.name();
-                match source_fields.field(name).map(StructField::data_type) {
-                    Some(source_type) if source_type == field.data_type() => {
-                        Ok(Expression::column([action, name]))
-                    }
-                    Some(source_type) => Err(KernelError::internal_error(format!(
-                        "`{action}.{name}` is {:?} in the read schema but {source_type:?} in the \
-                         source",
-                        field.data_type()
-                    ))),
-                    None if field.is_nullable() => Ok(null_lit(field.data_type().clone())),
-                    None => Err(KernelError::internal_error(format!(
-                        "the source has no `{action}.{name}`, which the read schema requires"
-                    ))),
-                }
-            })
+        let action_exprs = actions
+            .iter()
+            .map(|action| Ok((*action, action_expr(action, &source, &read_schema)?)))
             .collect::<KernelResult<Vec<_>>>()?;
-        let action_expr =
-            Expression::struct_with_nullability_from(fields, expr!(is_not_null(path(action))));
         let expr = struct_expr_from_schema(&read_schema, |name| {
-            (name == action).then(|| action_expr.clone())
+            action_exprs
+                .iter()
+                .find(|(action, _)| *action == name)
+                .map(|(_, expr)| expr.clone())
         })?;
         let evaluator = engine.evaluation_handler().new_expression_evaluator(
             source,
@@ -73,6 +58,40 @@ impl ActionProjector {
     pub(super) fn project(&self, data: &dyn EngineData) -> KernelResult<Box<dyn EngineData>> {
         self.evaluator.evaluate(data)
     }
+}
+
+/// The expression for the `action` struct of `read_schema`, copying each field `source` has and
+/// yielding null when the source row has no `action`.
+fn action_expr(
+    action: &str,
+    source: &StructType,
+    read_schema: &StructType,
+) -> KernelResult<Expression> {
+    let source_fields = action_struct(source, action)?;
+    let fields = action_struct(read_schema, action)?
+        .fields()
+        .map(|field| {
+            let name = field.name();
+            match source_fields.field(name).map(StructField::data_type) {
+                Some(source_type) if source_type == field.data_type() => {
+                    Ok(Expression::column([action, name]))
+                }
+                Some(source_type) => Err(KernelError::internal_error(format!(
+                    "`{action}.{name}` is {:?} in the read schema but {source_type:?} in the \
+                     source",
+                    field.data_type()
+                ))),
+                None if field.is_nullable() => Ok(null_lit(field.data_type().clone())),
+                None => Err(KernelError::internal_error(format!(
+                    "the source has no `{action}.{name}`, which the read schema requires"
+                ))),
+            }
+        })
+        .collect::<KernelResult<Vec<_>>>()?;
+    Ok(Expression::struct_with_nullability_from(
+        fields,
+        expr!(is_not_null(path(action))),
+    ))
 }
 
 /// The `action` struct of `schema`.
@@ -147,7 +166,7 @@ mod tests {
         let read_schema = add_without_stats_and_remove();
         let projector = ActionProjector::try_new(
             &engine,
-            ADD_NAME,
+            &[ADD_NAME],
             LOG_ADD_SCHEMA.clone(),
             read_schema.clone(),
         )
@@ -207,7 +226,7 @@ mod tests {
     ) {
         let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
         assert_result_error_with_message(
-            ActionProjector::try_new(&engine, ADD_NAME, source, read_schema),
+            ActionProjector::try_new(&engine, &[ADD_NAME], source, read_schema),
             message,
         );
     }

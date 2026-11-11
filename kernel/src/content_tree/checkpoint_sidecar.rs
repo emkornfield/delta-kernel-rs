@@ -30,7 +30,8 @@ pub(super) fn read_sidecar_actions(
         .iter()
         .map(|sidecar| sidecar.to_filemeta(log_root.log_root()))
         .collect::<KernelResult<Vec<_>>>()?;
-    let projector = ActionProjector::try_new(engine, action, source_schema.clone(), read_schema)?;
+    let projector =
+        ActionProjector::try_new(engine, &[action], source_schema.clone(), read_schema)?;
     let batches = engine
         .parquet_handler()
         .read_parquet_files(&files, source_schema, None)?;

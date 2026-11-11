@@ -10,7 +10,9 @@ use url::Url;
 
 use super::get_files_for_scan;
 use crate::arrow::array::StringArray;
-use crate::content_tree::test_utils::{added_data_entry, data_manifest_entry, write_manifest};
+use crate::content_tree::test_utils::{
+    added_data_entry, data_manifest_entry, test_dv_info, write_manifest,
+};
 use crate::content_tree::{ContentTreeNodeEntry, TrackingInfo, TrackingStatus};
 use crate::engine::sync::SyncEngine;
 use crate::expressions::{Predicate as Pred, col, lit};
@@ -21,9 +23,11 @@ use crate::transaction::BASE_ADD_FILES_SCHEMA;
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
     checkpoint_action_with_root, commit_file_changes, commit_files, commit_root_manifest,
     commit_root_manifest_file, create_adaptive_metadata_table, setup_adaptive_metadata_table,
-    write_manifest_commit_keeping_pm,
+    write_commit_after_manifest_commit, write_manifest_commit_keeping_pm,
 };
-use crate::unit_test_utils::{assert_result_error_with_message, string_array_to_engine_data};
+use crate::unit_test_utils::{
+    assert_result_error_with_message, parse_json_batch, string_array_to_engine_data,
+};
 use crate::{Engine, EngineData, FileMeta, KernelResult, Snapshot, Version};
 
 const TABLE_ROOT: &str = "memory:///";
@@ -98,6 +102,237 @@ fn scan_reads_latest_tree_then_later_commits(#[case] version: Version, #[case] e
     assert_eq!(
         scan_paths(&engine, snapshot_at(&engine, version)),
         strings(expected)
+    );
+}
+
+/// A table whose log is:
+/// - v0: protocol and metadata;
+/// - v1: a checkpoint action whose tree lists `a` and `b`;
+/// - v2: a standalone checkpoint whose inline rows add `c` and remove `a`;
+/// - v3: an add of `e`;
+/// - v4: an add of `f` and a remove of `b`.
+fn standalone_checkpoint_table() -> SyncEngine {
+    let (engine, _) = setup_adaptive_metadata_table();
+    commit_root_manifest(
+        &engine,
+        &table_root(),
+        "metadata/root-1.parquet",
+        &[
+            added_data_entry("a.parquet", 1, 1, 0, 0),
+            added_data_entry("b.parquet", 1, 1, 1, 0),
+        ],
+    );
+    commit_files(&engine, &table_root(), &["c.parquet"], &["a.parquet"]);
+    let snapshot = Snapshot::builder_for(TABLE_ROOT).build(&engine).unwrap();
+    snapshot.checkpoint(&engine, None).unwrap();
+    commit_files(&engine, &table_root(), &["e.parquet"], &[]);
+    commit_files(&engine, &table_root(), &["f.parquet"], &["b.parquet"]);
+    engine
+}
+
+#[rstest]
+#[case::at_standalone_checkpoint(2, &["b.parquet", "c.parquet"])]
+#[case::commit_after_standalone_checkpoint(3, &["b.parquet", "c.parquet", "e.parquet"])]
+#[case::commit_removes_tree_file(4, &["c.parquet", "e.parquet", "f.parquet"])]
+fn scan_chains_standalone_checkpoint_file_actions_then_tree(
+    #[case] version: Version,
+    #[case] expected: &[&str],
+) {
+    let engine = standalone_checkpoint_table();
+    let snapshot = snapshot_at(&engine, version);
+    assert_eq!(
+        snapshot
+            .latest_checkpoint_action(&engine)
+            .unwrap()
+            .map(|action| action.version()),
+        Some(2)
+    );
+    assert_eq!(scan_paths(&engine, snapshot), strings(expected));
+}
+
+#[test]
+fn incremental_update_reads_standalone_checkpoint_written_after_snapshot() {
+    let (engine, _) = setup_adaptive_metadata_table();
+    commit_root_manifest(
+        &engine,
+        &table_root(),
+        "metadata/root-1.parquet",
+        &[
+            added_data_entry("a.parquet", 1, 1, 0, 0),
+            added_data_entry("b.parquet", 1, 1, 1, 0),
+        ],
+    );
+    let before = snapshot_at(&engine, 1);
+    commit_files(&engine, &table_root(), &["c.parquet"], &["a.parquet"]);
+    commit_files(&engine, &table_root(), &["d.parquet"], &[]);
+    let latest = Snapshot::builder_for(TABLE_ROOT).build(&engine).unwrap();
+    latest.checkpoint(&engine, None).unwrap();
+
+    let updated = Snapshot::builder_from(before).build(&engine).unwrap();
+
+    assert_eq!(updated.log_segment().checkpoint_version, Some(3));
+    assert_eq!(
+        scan_paths(&engine, updated),
+        strings(&["b.parquet", "c.parquet", "d.parquet"])
+    );
+}
+
+#[test]
+fn scan_of_standalone_checkpoint_skips_inline_add_outside_predicate() {
+    let (engine, _) = setup_adaptive_metadata_table();
+    commit_root_manifest(
+        &engine,
+        &table_root(),
+        "metadata/root-1.parquet",
+        &[added_data_entry("tree.parquet", 1, 1, 0, 0)],
+    );
+    let adds = adds_with_id_ranges(
+        &engine,
+        &[("low.parquet", 1, 5), ("high.parquet", 200, 300)],
+    );
+    commit_file_changes(&engine, &table_root(), Some(adds), &[]);
+    Snapshot::builder_for(TABLE_ROOT)
+        .build(&engine)
+        .unwrap()
+        .checkpoint(&engine, None)
+        .unwrap();
+
+    let scan = snapshot_at(&engine, 2)
+        .scan_builder()
+        .with_predicate(Arc::new(Pred::gt(col!("id"), lit(100i64))))
+        .build()
+        .unwrap();
+    let paths: Vec<_> = get_files_for_scan(scan, &engine)
+        .unwrap()
+        .into_iter()
+        .sorted()
+        .collect();
+    assert_eq!(paths, strings(&["high.parquet", "tree.parquet"]));
+}
+
+/// A manifest commit after a standalone checkpoint supersedes it, so the scan reads only that
+/// commit's tree.
+#[test]
+fn scan_after_manifest_commit_superseding_standalone_checkpoint_reads_its_tree() {
+    let engine = standalone_checkpoint_table();
+    // The write path refuses a manifest commit on a standalone checkpoint, so the commit is
+    // written directly.
+    write_manifest(
+        &engine,
+        table_root().join("metadata/root-5.parquet").unwrap(),
+        &[added_data_entry("x.parquet", 1, 1, 0, 5)],
+    );
+    write_manifest_commit_keeping_pm(
+        &engine,
+        &table_root(),
+        5,
+        checkpoint_action_with_root("metadata/root-5.parquet", 1024, 5).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        scan_paths(&engine, snapshot_at(&engine, 5)),
+        strings(&["x.parquet"])
+    );
+}
+
+/// An inline remove of a deletion-vector tree entry cancels it, so only the kept entry remains.
+#[test]
+fn inline_remove_cancels_tree_entry_with_deletion_vector() {
+    let (engine, _) = setup_adaptive_metadata_table();
+    let dv_entry = ContentTreeNodeEntry {
+        deletion_vector: Some(test_dv_info()),
+        ..added_data_entry("dv.parquet", 1, 1, 0, 0)
+    };
+    commit_root_manifest(
+        &engine,
+        &table_root(),
+        "metadata/root-1.parquet",
+        &[dv_entry, added_data_entry("keep.parquet", 1, 1, 1, 0)],
+    );
+    commit_files(&engine, &table_root(), &[], &["dv.parquet"]);
+    Snapshot::builder_for(TABLE_ROOT)
+        .build(&engine)
+        .unwrap()
+        .checkpoint(&engine, None)
+        .unwrap();
+
+    assert_eq!(
+        scan_paths(&engine, snapshot_at(&engine, 2)),
+        strings(&["keep.parquet"])
+    );
+}
+
+/// The inline remove names the tree entry by its URI-encoded Delta path, which is how the reader
+/// matches it against the entry's location.
+#[test]
+#[ignore = "tree Add.path is the raw location, not its encoded form (#3319)"]
+fn inline_remove_with_percent_encoded_path_cancels_tree_entry() {
+    let (engine, _) = setup_adaptive_metadata_table();
+    commit_root_manifest(
+        &engine,
+        &table_root(),
+        "metadata/root-1.parquet",
+        &[
+            added_data_entry("my file.parquet", 1, 1, 0, 0),
+            added_data_entry("keep.parquet", 1, 1, 1, 0),
+        ],
+    );
+    let remove = json!({ "remove": { "path": "my%20file.parquet", "dataChange": true } });
+    write_commit_after_manifest_commit(
+        &engine,
+        &table_root(),
+        2,
+        1,
+        parse_json_batch(StringArray::from(vec![remove.to_string()])),
+    )
+    .unwrap();
+    Snapshot::builder_for(TABLE_ROOT)
+        .build(&engine)
+        .unwrap()
+        .checkpoint(&engine, None)
+        .unwrap();
+
+    assert_eq!(
+        scan_paths(&engine, snapshot_at(&engine, 2)),
+        strings(&["keep.parquet"])
+    );
+}
+
+#[test]
+fn inline_remove_cancels_leaf_manifest_entry() {
+    let (engine, _) = setup_adaptive_metadata_table();
+    let leaf_path = "metadata/leaf.parquet";
+    let leaf = write_manifest(
+        &engine,
+        table_root().join(leaf_path).unwrap(),
+        &[
+            added_data_entry("l1.parquet", 1, 1, 0, 0),
+            added_data_entry("l2.parquet", 1, 1, 1, 0),
+        ],
+    );
+    let mut leaf_entry = data_manifest_entry(leaf_path, leaf.size as i64, TrackingStatus::Added);
+    leaf_entry.tracking = TrackingInfo {
+        sequence_number: Some(1),
+        file_sequence_number: Some(1),
+        first_row_id: Some(10),
+        ..leaf_entry.tracking
+    };
+    commit_root_manifest(
+        &engine,
+        &table_root(),
+        "metadata/root-1.parquet",
+        &[leaf_entry, added_data_entry("r.parquet", 1, 1, 2, 0)],
+    );
+    commit_files(&engine, &table_root(), &[], &["l1.parquet"]);
+    Snapshot::builder_for(TABLE_ROOT)
+        .build(&engine)
+        .unwrap()
+        .checkpoint(&engine, None)
+        .unwrap();
+
+    assert_eq!(
+        scan_paths(&engine, snapshot_at(&engine, 2)),
+        strings(&["l2.parquet", "r.parquet"])
     );
 }
 
