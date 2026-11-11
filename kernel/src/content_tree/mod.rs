@@ -19,7 +19,9 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use bytes::Bytes;
-pub(crate) use checkpoint_action_stream::read_checkpoint_action;
+pub(crate) use checkpoint_action_stream::{
+    read_checkpoint_action, read_standalone_checkpoint_file_actions,
+};
 use delta_kernel_derive::ToSchema;
 use url::Url;
 
