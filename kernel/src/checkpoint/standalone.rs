@@ -1,8 +1,10 @@
-//! File actions of a standalone adaptiveMetadata checkpoint.
+//! File and non-file state of a standalone adaptiveMetadata checkpoint.
 //!
 //! A standalone checkpoint at version n carries, inline, the reconciled add and remove actions of
 //! the commits after its latest checkpoint action's content root, `(contentRoot.version, n]`.
-//! Those commits are not covered by the metadata tree the content root references.
+//! Those commits are not covered by the metadata tree the content root references. Its txn and
+//! domain metadata state is the latest checkpoint action's state, merged with the changes in
+//! `(checkpointMetadata.version, n]`.
 
 use itertools::Itertools;
 
@@ -14,8 +16,13 @@ use crate::action_reconciliation::file_metadata::build_checkpoint_read_schema;
 use crate::action_reconciliation::log_replay::{
     ActionReconciliationBatch, ActionReconciliationProcessor, RemoveRetention,
 };
-use crate::actions::CheckpointAction;
+use crate::action_reconciliation::merge_txns_and_domain_metadata;
+use crate::actions::set_transaction::scan_application_transactions;
+use crate::actions::{CheckpointAction, LOG_DOMAIN_METADATA_SCHEMA, LOG_TXN_SCHEMA};
+use crate::content_tree::read_checkpoint_action;
 use crate::log_replay::HasSelectionVector;
+use crate::log_segment::scan_domain_metadata_actions;
+use crate::path::LogRoot;
 use crate::snapshot::SnapshotRef;
 use crate::{Engine, KernelError, KernelResult, KernelResultIterator, Version, version_as_i64};
 
@@ -36,23 +43,8 @@ pub(crate) fn gap_file_actions(
     engine: &dyn Engine,
     action: &CheckpointAction,
 ) -> KernelResult<impl KernelResultIterator<ActionReconciliationBatch>> {
-    let log_segment = snapshot.log_segment();
-    // TODO: lift once a standalone predecessor's inline file actions are carried into the window.
-    if let Some(standalone_version) = log_segment.checkpoint_version
-        && version_as_i64(standalone_version)? >= action.version
-    {
-        return Err(KernelError::unsupported(format!(
-            "Checkpointing after the standalone checkpoint at version {standalone_version} is not \
-             yet supported; its checkpoint action's version is {}",
-            action.version
-        )));
-    }
-    let content_root_version = action.content_root_version();
-    let window_start = Version::try_from(content_root_version).map_err(|_| {
-        KernelError::generic(format!(
-            "Content root version {content_root_version} must not be negative"
-        ))
-    })?;
+    ensure_listed_checkpoint_below(snapshot, action)?;
+    let window_start = non_negative_version(action.content_root_version(), "Content root version")?;
 
     let mut context = CheckpointWriter::checkpoint_schema_context(snapshot, engine)?;
     // The inline adds are the only copy of the window's adds outside the commit JSON, so they keep
@@ -75,7 +67,7 @@ pub(crate) fn gap_file_actions(
 
     // TODO: log compaction files spanning the content root version must not feed this window.
     // Compaction is disabled (#2337).
-    let window = log_segment.segment_after_version(window_start);
+    let window = snapshot.log_segment().segment_after_version(window_start);
     // TODO: fail when reconciliation drops a backReference: a re-add without one after a remove
     // with one, or a remove without one after an add with one. Checking it needs backReference
     // columns and per-key state in the visitor.
@@ -92,6 +84,109 @@ pub(crate) fn gap_file_actions(
     Ok(transform_batches(reconciled, evaluator))
 }
 
+/// Computes the non-file state of the standalone checkpoint at `snapshot`'s version n, as a
+/// [`CheckpointAction`] for version n. `base` is `snapshot`'s latest checkpoint action. The result
+/// carries no file actions; [`gap_file_actions`] supplies those.
+///
+/// Txn and domain metadata changes in `(base.version(), n]` are merged over `base`'s state.
+/// Sidecars are reused per type: when no commit in the window changed that type, its sidecars are
+/// referenced unchanged and never read. Otherwise they are read and inlined, and the references are
+/// dropped.
+///
+/// # Errors
+///
+/// Returns an error if `snapshot` has a listed checkpoint file at or after `base`'s version.
+#[allow(dead_code)]
+pub(super) fn compute_standalone_non_file_state(
+    snapshot: &SnapshotRef,
+    engine: &dyn Engine,
+    base: &CheckpointAction,
+) -> KernelResult<CheckpointAction> {
+    ensure_listed_checkpoint_below(snapshot, base)?;
+    let base_version = non_negative_version(base.version(), "Checkpoint version")?;
+
+    let window = snapshot.log_segment().segment_after_version(base_version);
+    // TODO: the window is read here for transactions and domain metadata and again for file
+    // actions. A single pass would avoid the extra commit JSON reads.
+    let window_transactions =
+        scan_application_transactions(window.read_actions(engine, LOG_TXN_SCHEMA.clone())?, None)?;
+    let window_domain_metadata = window.scan_tail_including_tombstones(None, engine)?;
+    let transactions_changed = !window_transactions.is_empty();
+    // System domains are always inline, so only a user domain change makes sidecars stale.
+    let user_domain_metadata_changed = window_domain_metadata.values().any(|dm| !dm.is_internal());
+
+    let log_root = LogRoot::new(snapshot.table_root().clone())?;
+    // TODO(#2866): spill new or large inline txn and domain metadata sets into sidecars once a
+    // sidecar writer exists.
+    let (base_transactions, txn_sidecars) = if transactions_changed {
+        let spilled = read_checkpoint_action(engine, base, &log_root, LOG_TXN_SCHEMA.clone())?;
+        (scan_application_transactions(spilled, None)?, vec![])
+    } else {
+        let inline = base
+            .transactions
+            .iter()
+            .map(|txn| (txn.app_id.clone(), txn.clone()))
+            .collect();
+        (inline, base.txn_sidecars.clone())
+    };
+    let (base_domain_metadata, domain_metadata_sidecars) = if user_domain_metadata_changed {
+        let spilled =
+            read_checkpoint_action(engine, base, &log_root, LOG_DOMAIN_METADATA_SCHEMA.clone())?;
+        (scan_domain_metadata_actions(spilled, None)?, vec![])
+    } else {
+        let inline = base
+            .domain_metadata
+            .iter()
+            .map(|dm| (dm.domain().to_string(), dm.clone()))
+            .collect();
+        (inline, base.domain_metadata_sidecars.clone())
+    };
+
+    let (domain_metadata, transactions) = merge_txns_and_domain_metadata(
+        base_domain_metadata,
+        base_transactions,
+        window_domain_metadata.into_values(),
+        window_transactions.into_values(),
+        snapshot.table_configuration().table_properties(),
+    )?;
+    let table_config = snapshot.table_configuration();
+    Ok(CheckpointAction {
+        version: version_as_i64(snapshot.version())?,
+        content_root: base.content_root.clone(),
+        protocol: table_config.protocol().clone(),
+        metadata: table_config.metadata().clone(),
+        transactions: transactions.into_values().collect(),
+        domain_metadata: domain_metadata.into_values().collect(),
+        txn_sidecars,
+        domain_metadata_sidecars,
+    })
+}
+
+/// Errors if `snapshot`'s listed checkpoint file is at or after `action`'s version. The windows
+/// that start at `action` would miss that file's inline actions.
+fn ensure_listed_checkpoint_below(
+    snapshot: &SnapshotRef,
+    action: &CheckpointAction,
+) -> KernelResult<()> {
+    // TODO: lift once a standalone predecessor's inline actions are carried into the windows.
+    if let Some(standalone_version) = snapshot.log_segment().checkpoint_version
+        && version_as_i64(standalone_version)? >= action.version
+    {
+        return Err(KernelError::unsupported(format!(
+            "Checkpointing past the listed checkpoint at version {standalone_version} is not yet \
+             supported; the latest checkpoint action's version is {}",
+            action.version
+        )));
+    }
+    Ok(())
+}
+
+/// Converts a version read from a checkpoint action, naming `what` in the error.
+fn non_negative_version(value: i64, what: &str) -> KernelResult<Version> {
+    Version::try_from(value)
+        .map_err(|_| KernelError::generic(format!("{what} {value} must not be negative")))
+}
+
 #[cfg(test)]
 mod tests {
     use std::iter;
@@ -102,15 +197,18 @@ mod tests {
     use url::Url;
 
     use super::*;
+    use crate::actions::{DomainMetadata, SetTransaction};
     use crate::arrow::array::{Array as _, AsArray as _, RecordBatch, StringArray};
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::sync::SyncEngine;
+    use crate::expressions::Scalar;
     use crate::object_store::memory::InMemory;
     use crate::path::ParsedLogPath;
     use crate::unit_test_utils::adaptive_metadata_fixtures::{
-        adaptive_metadata_pm, minimal_checkpoint_action, protocol_and_metadata_lines,
-        setup_adaptive_metadata_table, write_commit_after_manifest_commit, write_ict_commit,
-        write_manifest_commit_keeping_pm,
+        adaptive_metadata_pm, adaptive_metadata_protocol_and_metadata, minimal_checkpoint_action,
+        protocol_and_metadata_lines, setup_adaptive_metadata_table, setup_table,
+        write_commit_after_manifest_commit, write_ict_commit, write_manifest_commit,
+        write_manifest_commit_keeping_pm, write_sidecar,
     };
     use crate::unit_test_utils::{parse_json_batch, test_schema_flat_with_column_mapping};
     use crate::{EngineData, Snapshot};
@@ -172,6 +270,47 @@ mod tests {
         write_manifest_commit_keeping_pm(&engine, &table_root, MANIFEST_VERSION, checkpoint)
             .unwrap();
         (engine, table_root)
+    }
+
+    /// A snapshot at version 3 whose listed checkpoint at version 2 stands in for a standalone
+    /// predecessor. The manifest commit at [`MANIFEST_VERSION`] is the latest checkpoint action
+    /// the windows would start from.
+    fn snapshot_after_standalone_predecessor() -> (SyncEngine, SnapshotRef) {
+        let (engine, table_root) = setup_manifest_commit(true);
+        let checkpoint_path = ParsedLogPath::new_classic_parquet_checkpoint(&table_root, 2)
+            .unwrap()
+            .location;
+        let pm_data = parse_json_batch(StringArray::from(
+            protocol_and_metadata_lines(test_schema_flat_with_column_mapping(), &[])
+                .lines()
+                .map(String::from)
+                .collect::<Vec<_>>(),
+        ));
+        engine
+            .parquet_handler()
+            .write_parquet_file(checkpoint_path, Box::new(iter::once(Ok(pm_data))))
+            .unwrap();
+        write_commit_after_manifest_commit(
+            &engine,
+            &table_root,
+            3,
+            MANIFEST_VERSION,
+            commit_data(&[add("a")]),
+        )
+        .unwrap();
+        let snapshot = Snapshot::builder_for(table_root)
+            .at_version(3)
+            .build(&engine)
+            .unwrap();
+        (engine, snapshot)
+    }
+
+    fn assert_standalone_predecessor_error(err: &KernelError) {
+        let message = err.to_string();
+        assert!(
+            message.contains("version 2") && message.contains("version is 1"),
+            "unexpected error: {message}"
+        );
     }
 
     /// The selected rows of the gap file actions of the table at `version`.
@@ -320,42 +459,208 @@ mod tests {
 
     #[test]
     fn gap_file_actions_rejects_standalone_predecessor() {
-        let (engine, table_root) = setup_manifest_commit(true);
-        // A listed checkpoint at version 2 stands in for a standalone predecessor: the window
-        // would need its inline file actions, which are not carried yet.
-        let checkpoint_path = ParsedLogPath::new_classic_parquet_checkpoint(&table_root, 2)
-            .unwrap()
-            .location;
-        let pm_data = parse_json_batch(StringArray::from(
-            protocol_and_metadata_lines(test_schema_flat_with_column_mapping(), &[])
-                .lines()
-                .map(String::from)
-                .collect::<Vec<_>>(),
-        ));
-        engine
-            .parquet_handler()
-            .write_parquet_file(checkpoint_path, Box::new(iter::once(Ok(pm_data))))
-            .unwrap();
-        write_commit_after_manifest_commit(
-            &engine,
-            &table_root,
-            3,
-            MANIFEST_VERSION,
-            commit_data(&[add("a")]),
-        )
-        .unwrap();
-
-        let snapshot = Snapshot::builder_for(table_root.clone())
-            .at_version(3)
-            .build(&engine)
-            .unwrap();
-        // The pointer names a commit this segment does not list, so the action is built directly.
+        let (engine, snapshot) = snapshot_after_standalone_predecessor();
         let action = minimal_checkpoint_action("metadata/root.parquet", MANIFEST_VERSION).unwrap();
         let err = gap_file_actions(&snapshot, &engine, &action).err().unwrap();
-        let message = err.to_string();
-        assert!(
-            message.contains("version 2") && message.contains("version is 1"),
-            "unexpected error: {message}"
+        assert_standalone_predecessor_error(&err);
+    }
+
+    fn dm(domain: &str, removed: bool) -> String {
+        json!({ "domainMetadata": { "domain": domain, "configuration": "cfg", "removed": removed } })
+            .to_string()
+    }
+
+    fn txn_row(app_id: &str) -> Scalar {
+        SetTransaction::new(app_id.to_string(), 1, None).into()
+    }
+
+    fn dm_row(domain: &str) -> Scalar {
+        DomainMetadata::new(domain.to_string(), "cfg".to_string()).into()
+    }
+
+    /// A manifest commit at [`MANIFEST_VERSION`] whose checkpoint action holds `inline-app` and
+    /// `user.inline` inline, and `sidecar-app` and `user.sidecar` in one txn sidecar and one
+    /// domain metadata sidecar. Its content root carries tags.
+    fn setup_with_sidecars() -> (SyncEngine, Url) {
+        let (engine, table_root) = setup_table().unwrap();
+        let txn_sidecar = write_sidecar(
+            &engine,
+            &table_root,
+            "txns.parquet",
+            LOG_TXN_SCHEMA.clone(),
+            vec![txn_row("sidecar-app")],
         );
+        let dm_sidecar = write_sidecar(
+            &engine,
+            &table_root,
+            "dms.parquet",
+            LOG_DOMAIN_METADATA_SCHEMA.clone(),
+            vec![dm_row("user.sidecar")],
+        );
+        let mut checkpoint =
+            minimal_checkpoint_action("metadata/root.parquet", MANIFEST_VERSION).unwrap();
+        checkpoint.content_root = serde_json::from_value(json!({
+            "path": "metadata/root.parquet",
+            "sizeInBytes": 1024,
+            "version": MANIFEST_VERSION,
+            "tags": { "writer": "test" },
+        }))
+        .unwrap();
+        checkpoint.transactions = vec![SetTransaction::new("inline-app".to_string(), 1, None)];
+        checkpoint.domain_metadata = vec![DomainMetadata::new(
+            "user.inline".to_string(),
+            "cfg".to_string(),
+        )];
+        checkpoint.txn_sidecars = vec![txn_sidecar];
+        checkpoint.domain_metadata_sidecars = vec![dm_sidecar];
+        write_manifest_commit(&engine, &table_root, MANIFEST_VERSION, checkpoint).unwrap();
+        (engine, table_root)
+    }
+
+    /// Writes `window` as the commit at version 2 and returns the snapshot at that version, with
+    /// its latest checkpoint action.
+    fn snapshot_with_window(
+        engine: &SyncEngine,
+        table_root: &Url,
+        window: &[String],
+    ) -> (SnapshotRef, Arc<CheckpointAction>) {
+        write_commit_after_manifest_commit(
+            engine,
+            table_root,
+            2,
+            MANIFEST_VERSION,
+            commit_data(window),
+        )
+        .unwrap();
+        let snapshot = Snapshot::builder_for(table_root.clone())
+            .build(engine)
+            .unwrap();
+        let base = snapshot.latest_checkpoint_action(engine).unwrap().unwrap();
+        (snapshot, base)
+    }
+
+    #[rstest]
+    #[case::no_change_reuses_both_sidecar_types(
+        vec![add("a")],
+        &["inline-app"],
+        &["user.inline"],
+        true,
+        true,
+    )]
+    #[case::txn_change_inlines_txn_sidecars(
+        vec![txn("window-app")],
+        &["inline-app", "sidecar-app", "window-app"],
+        &["user.inline"],
+        false,
+        true,
+    )]
+    #[case::user_dm_removal_inlines_dm_sidecars(
+        vec![dm("user.sidecar", true)],
+        &["inline-app"],
+        &["user.inline"],
+        true,
+        false,
+    )]
+    #[case::system_dm_change_keeps_dm_sidecars(
+        vec![dm("delta.sys", false)],
+        &["inline-app"],
+        &["delta.sys", "user.inline"],
+        true,
+        true,
+    )]
+    fn non_file_state_reuses_sidecars_per_type(
+        #[case] window: Vec<String>,
+        #[case] expected_app_ids: &[&str],
+        #[case] expected_domains: &[&str],
+        #[case] reuses_txn_sidecars: bool,
+        #[case] reuses_dm_sidecars: bool,
+    ) {
+        let (engine, table_root) = setup_with_sidecars();
+        let (snapshot, base) = snapshot_with_window(&engine, &table_root, &window);
+
+        let action = compute_standalone_non_file_state(&snapshot, &engine, &base).unwrap();
+
+        assert_eq!(action.version(), 2);
+        assert_eq!(action.content_root, base.content_root);
+        let mut app_ids: Vec<_> = action
+            .transactions
+            .iter()
+            .map(|txn| txn.app_id.as_str())
+            .collect();
+        app_ids.sort_unstable();
+        assert_eq!(app_ids, expected_app_ids);
+        let mut domains: Vec<_> = action
+            .domain_metadata
+            .iter()
+            .map(|dm| dm.domain())
+            .collect();
+        domains.sort_unstable();
+        assert_eq!(domains, expected_domains);
+        let expected_txn_sidecars = if reuses_txn_sidecars {
+            base.txn_sidecars.clone()
+        } else {
+            vec![]
+        };
+        assert_eq!(action.txn_sidecars, expected_txn_sidecars);
+        let expected_dm_sidecars = if reuses_dm_sidecars {
+            base.domain_metadata_sidecars.clone()
+        } else {
+            vec![]
+        };
+        assert_eq!(action.domain_metadata_sidecars, expected_dm_sidecars);
+    }
+
+    /// The inline merge drops transactions older than the table's retention, including those the
+    /// window adds, and keeps the rest.
+    #[test]
+    fn non_file_state_drops_expired_transactions() {
+        let (engine, table_root) = setup_with_sidecars();
+        let (_, metadata) = adaptive_metadata_pm(test_schema_flat_with_column_mapping(), &[]);
+        let mut metadata = serde_json::to_value(&metadata).unwrap();
+        metadata["configuration"]["delta.setTransactionRetentionDuration"] =
+            json!("interval 1 day");
+        let window = [
+            json!({ "metaData": metadata }).to_string(),
+            json!({ "txn": { "appId": "expired-app", "version": 1, "lastUpdated": 1 } })
+                .to_string(),
+        ];
+        let (snapshot, base) = snapshot_with_window(&engine, &table_root, &window);
+
+        let action = compute_standalone_non_file_state(&snapshot, &engine, &base).unwrap();
+
+        let app_ids: Vec<_> = action
+            .transactions
+            .iter()
+            .map(|txn| txn.app_id.as_str())
+            .collect();
+        assert!(app_ids.contains(&"inline-app"), "{app_ids:?}");
+        assert!(!app_ids.contains(&"expired-app"), "{app_ids:?}");
+    }
+
+    #[test]
+    fn non_file_state_takes_protocol_and_metadata_from_snapshot() {
+        let (engine, table_root) = setup_with_sidecars();
+        let (_, metadata) = adaptive_metadata_protocol_and_metadata();
+        let mut metadata = serde_json::to_value(metadata).unwrap();
+        metadata["description"] = json!("changed");
+        let window = [json!({ "metaData": metadata }).to_string()];
+        let (snapshot, base) = snapshot_with_window(&engine, &table_root, &window);
+
+        let action = compute_standalone_non_file_state(&snapshot, &engine, &base).unwrap();
+
+        assert_eq!(base.metadata().description(), None);
+        assert_eq!(action.metadata().description(), Some("changed"));
+        assert_eq!(action.metadata(), snapshot.table_configuration().metadata());
+        assert_eq!(action.protocol(), snapshot.table_configuration().protocol());
+    }
+
+    #[test]
+    fn non_file_state_rejects_standalone_predecessor() {
+        let (engine, snapshot) = snapshot_after_standalone_predecessor();
+        let action = minimal_checkpoint_action("metadata/root.parquet", MANIFEST_VERSION).unwrap();
+        let err = compute_standalone_non_file_state(&snapshot, &engine, &action)
+            .err()
+            .unwrap();
+        assert_standalone_predecessor_error(&err);
     }
 }

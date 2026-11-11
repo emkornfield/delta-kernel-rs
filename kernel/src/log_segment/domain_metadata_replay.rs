@@ -62,7 +62,7 @@ impl LogSegment {
     /// Reverse-replay this segment for domain metadata, keeping tombstones. Terminates early once
     /// every requested domain is decided (a tombstone counts as decided). The CRC-rooted path keeps
     /// tombstones so a removal in a newer commit can suppress a domain the base holds.
-    fn scan_tail_including_tombstones(
+    pub(crate) fn scan_tail_including_tombstones(
         &self,
         domains: Option<&HashSet<&str>>,
         engine: &dyn Engine,
