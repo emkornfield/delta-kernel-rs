@@ -951,9 +951,8 @@ async fn replay_skips_commits_below_pointed_content_root() {
 }
 
 // The pointed manifest commit is newer than the segment's checkpoint, but its content root is not.
-// The non-plan replay reads the whole segment and captures the pointed action. A plan replay
-// bounded by a checkpoint file reads only the newest commit's action, so the snapshot follows the
-// pointer to the pointed one.
+// The pointed action is not newer than that checkpoint, so replay does not capture it and the
+// snapshot follows the pointer to it.
 #[tokio::test]
 async fn replay_resolves_pointed_action_above_segment_checkpoint() {
     let log = ReplayLog::after_manifest_commit(vec![
@@ -966,7 +965,7 @@ async fn replay_resolves_pointed_action_above_segment_checkpoint() {
     ])
     .with_checkpoint_at(1);
     let non_plan = ReplayExpectation::default()
-        .captured(Some(1))
+        .captured(None)
         .schema(one_column_schema())
         .last_manifest_commit(resolved_pointer(2, 1));
     assert_replay(&log, None, &non_plan, non_plan_engine).await;
@@ -1023,14 +1022,29 @@ impl PlanExecutor for RecordingPlanExecutor {
 
 // A standalone checkpoint written after the manifest commit hides that commit from the segment.
 // Replay still resolves P&M from the checkpoint and the newest commit's pointer without reading the
-// pointed commit, which is deleted here. The action is read from the checkpoint file instead.
+// pointed commit, which is deleted here. The imperative replay drains the checkpoint file and
+// captures its action; the plan path does not capture, so the lookup reads the file.
 #[tokio::test]
 async fn standalone_checkpoint_above_pointed_commit_resolves_its_action() {
-    on_both_paths!(check_standalone_checkpoint_above_pointed_commit());
+    check_standalone_checkpoint_above_pointed_commit(
+        non_plan_engine,
+        resolved_pointer(0, 0),
+        Some(1),
+    )
+    .await;
+    #[cfg(feature = "declarative-plans")]
+    check_standalone_checkpoint_above_pointed_commit(
+        plan_engine,
+        resolved_pointer(0, 0),
+        None,
+    )
+    .await;
 }
 
 async fn check_standalone_checkpoint_above_pointed_commit<E: Engine>(
     make_engine: impl FnOnce(Arc<InMemory>) -> E,
+    expected_last_manifest_commit: LastManifestCommitResolution,
+    captured_version: Option<i64>,
 ) {
     let carrier = commit_info(Some(pointer(0, 0)));
     let (store, table_root) = manifest_commit_table(&[carrier.clone(), carrier]).await;
@@ -1047,8 +1061,8 @@ async fn check_standalone_checkpoint_above_pointed_commit<E: Engine>(
         .read_protocol_metadata_opt(&engine, None)
         .unwrap();
     ReplayExpectation::default()
-        .captured(None)
-        .last_manifest_commit(resolved_pointer(0, 0))
+        .captured(captured_version)
+        .last_manifest_commit(expected_last_manifest_commit)
         .check(resolution);
 
     let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();

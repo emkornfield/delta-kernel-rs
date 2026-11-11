@@ -311,9 +311,8 @@ impl Snapshot {
     }
 
     /// `captured_checkpoint_action` is the latest checkpoint action when the build already has it
-    /// in hand; `None` means not captured, not known absent. A captured action is trusted without
-    /// checking it against `lastManifestCommit`, unless it is not newer than the listed checkpoint,
-    /// in which case the lazy lookup decides.
+    /// in hand; `None` means not captured, not known absent. Replay has already checked it, so it
+    /// is trusted as is.
     /// `last_manifest_commit` is how the build resolved `lastManifestCommit` without the CRC. A CRC
     /// at the snapshot version takes precedence, since it records the value authoritatively,
     /// including its absence.
@@ -342,10 +341,6 @@ impl Snapshot {
             (None, LastManifestCommitResolution::Resolved(resolved)) => OnceLock::from(resolved),
             (None, LastManifestCommitResolution::Unresolved) => OnceLock::new(),
         };
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        let superseding_captured_action = captured_checkpoint_action.filter(|resolved| {
-            captured_action_supersedes_checkpoint(&log_segment, &resolved.action)
-        });
         Self {
             span,
             log_segment,
@@ -359,7 +354,7 @@ impl Snapshot {
             #[cfg(feature = "declarative-plans")]
             checkpoint_info_init: Mutex::new(()),
             #[cfg(feature = "adaptive-metadata-in-dev")]
-            checkpoint_action: match superseding_captured_action {
+            checkpoint_action: match captured_checkpoint_action {
                 Some(action) => OnceLock::from(Some(action)),
                 None => OnceLock::new(),
             },
@@ -2207,22 +2202,6 @@ impl Snapshot {
             self.built_as_latest,
             self.skipped_new_checkpoints,
         )?))
-    }
-}
-
-/// Whether a checkpoint action that replay captured is newer than the listed checkpoint. A captured
-/// action that is not is dropped, so the lazy lookup reads and checks it instead: skipping a
-/// capture never changes the result, only where it comes from.
-#[cfg(feature = "adaptive-metadata-in-dev")]
-fn captured_action_supersedes_checkpoint(
-    log_segment: &LogSegment,
-    action: &CheckpointAction,
-) -> bool {
-    match log_segment.checkpoint_version {
-        None => true,
-        Some(checkpoint) => {
-            version_as_i64(checkpoint).is_ok_and(|version| action.version > version)
-        }
     }
 }
 
