@@ -597,10 +597,10 @@ fn write_raw_commit(engine: &SyncEngine, version: Version, lines: &[serde_json::
 /// The `(adds, removes)` paths inline in the standalone checkpoint file that `snapshot`'s latest
 /// checkpoint action is read from.
 fn inline_paths(engine: &SyncEngine, snapshot: &Snapshot) -> (Vec<String>, Vec<String>) {
-    let Some((_, CheckpointActionSource::Standalone { file, .. })) = snapshot
-        .latest_checkpoint_action_with_source(engine)
-        .unwrap()
-    else {
+    let Some(resolved) = snapshot.resolved_checkpoint_action(engine).unwrap() else {
+        panic!("latest checkpoint action is not read from a standalone file");
+    };
+    let CheckpointActionSource::Standalone { file, .. } = &resolved.source else {
         panic!("latest checkpoint action is not read from a standalone file");
     };
     let (mut adds, mut removes) = (vec![], vec![]);
@@ -687,12 +687,12 @@ fn standalone_checkpoint_chains_into_next_standalone_checkpoint(#[case] cleanup:
     let snapshot = snapshot_at(&engine, 4);
 
     // Reloaded from storage, the latest action is the one in S2's file.
-    let (action, source) = snapshot
-        .latest_checkpoint_action_with_source(&engine)
+    let resolved = snapshot
+        .resolved_checkpoint_action(&engine)
         .unwrap()
         .unwrap();
-    assert_eq!(action.version(), 4);
-    let CheckpointActionSource::Standalone { file, .. } = source else {
+    assert_eq!(resolved.action.version(), 4);
+    let CheckpointActionSource::Standalone { file, .. } = &resolved.source else {
         panic!("latest checkpoint action is not read from a standalone file");
     };
     assert_eq!(file.version, 4);

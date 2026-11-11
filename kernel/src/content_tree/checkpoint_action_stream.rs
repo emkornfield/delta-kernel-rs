@@ -240,8 +240,8 @@ mod tests {
         create_adaptive_metadata_table, write_sidecar,
     };
     use crate::unit_test_utils::{
-        Action, TestCancellationToken, assert_result_error_with_message, create_log_path,
-        create_log_path_with_size, test_schema_flat_with_column_mapping,
+        Action, TestCancellationToken, assert_result_error_with_message, create_log_path_with_size,
+        test_schema_flat_with_column_mapping,
     };
     use crate::{CancellationTokenRef, Version};
 
@@ -577,54 +577,6 @@ mod tests {
             COMMIT_READ_SCHEMA.clone(),
             CHECKPOINT_READ_SCHEMA.clone(),
         );
-
-        assert_result_error_with_message(result, message);
-    }
-
-    #[rstest]
-    #[case::file_version_differs(
-        2,
-        2,
-        3,
-        "standalone checkpoint file at version 3 does not match the checkpoint action at version 2"
-    )]
-    #[case::content_root_newer_than_action(
-        2,
-        3,
-        2,
-        "checkpoint action at version 2 has content root version 3, which is newer than its version"
-    )]
-    fn standalone_source_rejects_mismatched_file_or_content_root(
-        #[case] version: Version,
-        #[case] content_root_version: i64,
-        #[case] file_version: Version,
-        #[case] message: &str,
-    ) {
-        let store = Arc::new(InMemory::new());
-        let engine = two_adds_then_add_and_remove(&store);
-        let checkpoint = CheckpointAction {
-            content_root: ContentRoot::new(ROOT_PATH.to_string(), 1, content_root_version),
-            ..checkpoint_action_with_root(ROOT_PATH, 1, version).unwrap()
-        };
-        let file = create_log_path(&format!(
-            "{TABLE_ROOT}_delta_log/{file_version:020}.checkpoint.parquet"
-        ));
-        let source = CheckpointActionSource::Standalone {
-            file,
-            pointer: None,
-        };
-
-        let result = latest_log_segment(&table_root(), &engine)
-            .read_actions_with_checkpoint_action(
-                &engine,
-                &checkpoint,
-                &source,
-                &table_root(),
-                COMMIT_READ_SCHEMA.clone(),
-                CHECKPOINT_READ_SCHEMA.clone(),
-                None,
-            )
-            .map(|_| ());
 
         assert_result_error_with_message(result, message);
     }

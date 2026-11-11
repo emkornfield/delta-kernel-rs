@@ -54,6 +54,8 @@ use crate::{
     RowVisitor, StorageHandler, Version,
 };
 
+#[cfg(feature = "adaptive-metadata-in-dev")]
+mod checkpoint_action;
 mod crc_replay;
 mod domain_metadata_replay;
 mod protocol_metadata_replay;
@@ -63,8 +65,6 @@ pub(crate) use domain_metadata_replay::{DomainMetadataMap, scan_domain_metadata_
 #[cfg(feature = "adaptive-metadata-in-dev")]
 pub(crate) use protocol_metadata_replay::LastManifestCommitResolution;
 pub(crate) use protocol_metadata_replay::PmResolution;
-#[cfg(feature = "adaptive-metadata-in-dev")]
-pub(crate) use standalone_checkpoint::read_standalone_checkpoint_action_for_pointer;
 
 #[cfg(test)]
 mod crc_tests;
@@ -143,12 +143,60 @@ pub(crate) enum CheckpointActionSource {
         /// The version of the listed standalone checkpoint that this commit supersedes, if any.
         superseded_standalone: Option<i64>,
     },
-    /// The listed standalone checkpoint file. `pointer` is the `lastManifestCommit` checked
-    /// against the file, or `None` when the snapshot cannot read it.
+    /// The listed standalone checkpoint file, checked against the snapshot's `lastManifestCommit`.
     Standalone {
         file: ParsedLogPath<FileMeta>,
-        pointer: Option<LastManifestCommit>,
+        pointer: StandalonePointer,
     },
+}
+
+/// What a standalone checkpoint's content root is checked against.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+pub(crate) enum StandalonePointer {
+    /// The snapshot's `lastManifestCommit`. The file's content root must match its version.
+    Known(LastManifestCommit),
+    /// The snapshot's `lastManifestCommit` cannot be read: its commit and the CRC are gone. The
+    /// file alone holds the action.
+    Unknown,
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+impl StandalonePointer {
+    /// The `lastManifestCommit` to check the file against, or `None` when it is unknown.
+    pub(crate) fn known(&self) -> Option<&LastManifestCommit> {
+        match self {
+            Self::Known(pointer) => Some(pointer),
+            Self::Unknown => None,
+        }
+    }
+}
+
+/// A checkpoint action together with the source it was read from. The snapshot caches the pair,
+/// so the source and the action cannot disagree.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+pub(crate) struct ResolvedCheckpointAction {
+    pub(crate) action: Arc<CheckpointAction>,
+    pub(crate) source: CheckpointActionSource,
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+impl ResolvedCheckpointAction {
+    /// The checkpoint action that the manifest commit at `commit_version` wrote. That commit's
+    /// own `lastManifestCommit` names it. Its version is newer than any listed checkpoint, so the
+    /// listed standalone checkpoint, if any, is not recorded as superseded.
+    pub(crate) fn from_manifest_commit(commit_version: i64, action: CheckpointAction) -> Self {
+        let pointer = LastManifestCommit {
+            version: commit_version,
+            content_root_version: action.content_root_version(),
+        };
+        Self {
+            action: Arc::new(action),
+            source: CheckpointActionSource::ManifestCommit {
+                pointer,
+                superseded_standalone: None,
+            },
+        }
+    }
 }
 
 /// A [`LogSegment`] represents a contiguous section of the log and is made of checkpoint files
@@ -1050,26 +1098,7 @@ impl LogSegment {
                 }
                 None
             }
-            CheckpointActionSource::Standalone { file, .. } => {
-                require!(
-                    checkpoint.content_root_version() <= checkpoint.version(),
-                    KernelError::invalid_checkpoint(format!(
-                        "checkpoint action at version {} has content root version {}, which is \
-                         newer than its version",
-                        checkpoint.version(),
-                        checkpoint.content_root_version()
-                    ))
-                );
-                require!(
-                    file.version == version,
-                    KernelError::invalid_log_segment(format!(
-                        "standalone checkpoint file at version {} does not match the checkpoint \
-                         action at version {version}",
-                        file.version
-                    ))
-                );
-                Some(file)
-            }
+            CheckpointActionSource::Standalone { file, .. } => Some(file),
         };
 
         // Inline rows are log-shaped, so they read with the commit schema like the commits do.

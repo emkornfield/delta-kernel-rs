@@ -30,12 +30,9 @@ use crate::expressions::ColumnName;
 use crate::incremental_scan::IncrementalScanBuilder;
 use crate::log_replay::ActionsBatch;
 #[cfg(feature = "adaptive-metadata-in-dev")]
-#[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::log_segment::CheckpointActionSource;
-#[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::log_segment::LastManifestCommitResolution;
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::log_segment::read_standalone_checkpoint_action_for_pointer;
+use crate::log_segment::{CheckpointActionSource, ResolvedCheckpointAction};
 use crate::log_segment::{
     DomainMetadataMap, LogSegment, PmResolution, scan_domain_metadata_actions,
 };
@@ -133,7 +130,7 @@ pub struct Snapshot {
     /// to a new snapshot's segment, not this one. Behind an [`Arc`] so repeated calls clone
     /// only the pointer, not the action's inline transaction and domain-metadata vectors.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    checkpoint_action: OnceLock<Option<Arc<CheckpointAction>>>,
+    checkpoint_action: OnceLock<Option<Arc<ResolvedCheckpointAction>>>,
     /// This snapshot's `lastManifestCommit`, resolved during build or on first access
     /// (see [`LastManifestCommitResolution`]). Safe to cache like [`Self::checkpoint_action`].
     #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -180,7 +177,7 @@ struct PreparedSnapshot {
     table_configuration: TableConfiguration,
     crc: SnapshotCrc,
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    captured_checkpoint_action: Option<Arc<CheckpointAction>>,
+    captured_checkpoint_action: Option<Arc<ResolvedCheckpointAction>>,
     #[cfg(feature = "adaptive-metadata-in-dev")]
     last_manifest_commit: LastManifestCommitResolution,
 }
@@ -287,7 +284,7 @@ impl Snapshot {
         built_as_latest: bool,
         skipped_new_checkpoints: bool,
         #[cfg(feature = "adaptive-metadata-in-dev")] captured_checkpoint_action: Option<
-            Arc<CheckpointAction>,
+            Arc<ResolvedCheckpointAction>,
         >,
         #[cfg(feature = "adaptive-metadata-in-dev")]
         last_manifest_commit: LastManifestCommitResolution,
@@ -306,8 +303,9 @@ impl Snapshot {
             (None, LastManifestCommitResolution::Unresolved) => OnceLock::new(),
         };
         #[cfg(feature = "adaptive-metadata-in-dev")]
-        let superseding_captured_action = captured_checkpoint_action
-            .filter(|action| captured_action_supersedes_checkpoint(&log_segment, action));
+        let superseding_captured_action = captured_checkpoint_action.filter(|resolved| {
+            captured_action_supersedes_checkpoint(&log_segment, &resolved.action)
+        });
         Self {
             span,
             log_segment,
@@ -345,42 +343,9 @@ impl Snapshot {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<Option<Arc<CheckpointAction>>> {
-        if !self.has_adaptive_metadata() {
-            return Ok(None);
-        }
-        if let Some(cached) = self.checkpoint_action.get() {
-            return Ok(cached.clone());
-        }
-        let resolved = match self.checkpoint_source(engine)? {
-            None => None,
-            Some(CheckpointActionSource::Standalone { file, pointer }) => Some(
-                read_standalone_checkpoint_action_for_pointer(engine, &file, pointer.as_ref())?,
-            ),
-            Some(CheckpointActionSource::ManifestCommit {
-                pointer,
-                superseded_standalone,
-            }) => {
-                let action = self
-                    .log_segment
-                    .read_last_checkpoint_action_from_pointer(engine, &pointer)?;
-                if let Some(standalone) = superseded_standalone {
-                    require!(
-                        action.version > standalone,
-                        KernelError::invalid_log_segment(format!(
-                            "lastManifestCommit names manifest commit version {} whose checkpoint \
-                             action has checkpointMetadata.version {}, which does not exceed the \
-                             standalone checkpoint at version {standalone} that it supersedes",
-                            pointer.version, action.version
-                        ))
-                    );
-                }
-                Some(action)
-            }
-        }
-        .map(Arc::new);
-        // A concurrent caller may win the race to fill the cell; both read the same file.
-        let _ = self.checkpoint_action.set(resolved.clone());
-        Ok(resolved)
+        Ok(self
+            .resolved_checkpoint_action(engine)?
+            .map(|resolved| Arc::clone(&resolved.action)))
     }
 
     /// The version of the standalone checkpoint that [`Self::latest_checkpoint_action`] reads
@@ -390,31 +355,34 @@ impl Snapshot {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<Option<Version>> {
-        if !self.has_adaptive_metadata() {
-            return Ok(None);
-        }
-        Ok(match self.checkpoint_source(engine)? {
-            Some(CheckpointActionSource::Standalone { file, .. }) => Some(file.version),
-            _ => None,
-        })
+        Ok(self
+            .resolved_checkpoint_action(engine)?
+            .and_then(|resolved| match &resolved.source {
+                CheckpointActionSource::Standalone { file, .. } => Some(file.version),
+                CheckpointActionSource::ManifestCommit { .. } => None,
+            }))
     }
 
     /// The latest checkpoint action (see [`Self::latest_checkpoint_action`]) together with the
-    /// source it is read from.
+    /// source it is read from. The pair is resolved once and cached.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    pub(crate) fn latest_checkpoint_action_with_source(
+    pub(crate) fn resolved_checkpoint_action(
         &self,
         engine: &dyn Engine,
-    ) -> KernelResult<Option<(Arc<CheckpointAction>, CheckpointActionSource)>> {
+    ) -> KernelResult<Option<Arc<ResolvedCheckpointAction>>> {
         if !self.has_adaptive_metadata() {
             return Ok(None);
         }
-        let Some(source) = self.checkpoint_source(engine)? else {
-            return Ok(None);
-        };
-        Ok(self
-            .latest_checkpoint_action(engine)?
-            .map(|action| (action, source)))
+        if let Some(cached) = self.checkpoint_action.get() {
+            return Ok(cached.clone());
+        }
+        let resolved = self
+            .log_segment
+            .latest_checkpoint_action(engine, || self.last_manifest_commit(engine))?
+            .map(Arc::new);
+        // A concurrent caller may win the race to fill the cell; both read the same file.
+        let _ = self.checkpoint_action.set(resolved.clone());
+        Ok(resolved)
     }
 
     /// Reads this snapshot's log with `schema`, newest first, for log replay. For a table with an
@@ -426,11 +394,11 @@ impl Snapshot {
         schema: SchemaRef,
     ) -> KernelResult<Box<dyn KernelResultIterator<ActionsBatch>>> {
         #[cfg(feature = "adaptive-metadata-in-dev")]
-        if let Some((checkpoint, source)) = self.latest_checkpoint_action_with_source(engine)? {
+        if let Some(resolved) = self.resolved_checkpoint_action(engine)? {
             let result = self.log_segment.read_actions_with_checkpoint_action(
                 engine,
-                &checkpoint,
-                &source,
+                &resolved.action,
+                &resolved.source,
                 self.table_root(),
                 schema.clone(),
                 schema,
@@ -632,6 +600,15 @@ impl Snapshot {
         let last_manifest_commit =
             LastManifestCommitResolution::Resolved(crc_delta.last_manifest_commit.clone());
 
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let committed_checkpoint_action = match checkpoint_action {
+            Some(action) => Some(Arc::new(ResolvedCheckpointAction::from_manifest_commit(
+                version_as_i64(new_version)?,
+                action,
+            ))),
+            None => None,
+        };
+
         // `crc_delta` covers what the transaction committed, so it advances an at-version CRC;
         // a stale base is carried forward unadvanced.
         let new_crc = match self.crc_at_version() {
@@ -654,9 +631,7 @@ impl Snapshot {
             true, /* built_as_latest */
             self.skipped_new_checkpoints,
             #[cfg(feature = "adaptive-metadata-in-dev")]
-            checkpoint_action
-                .map(Arc::new)
-                .or_else(|| self.checkpoint_action.get().cloned().flatten()),
+            committed_checkpoint_action.or_else(|| self.checkpoint_action.get().cloned().flatten()),
             #[cfg(feature = "adaptive-metadata-in-dev")]
             last_manifest_commit,
         ))
@@ -1335,41 +1310,6 @@ impl Snapshot {
         Ok((in_commit_timestamp, last_manifest_commit))
     }
 
-    /// Decides where the latest checkpoint action is read from. The listed standalone checkpoint
-    /// wins unless `lastManifestCommit` is newer than it.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    fn checkpoint_source(
-        &self,
-        engine: &dyn Engine,
-    ) -> KernelResult<Option<CheckpointActionSource>> {
-        let standalone = self.log_segment.standalone_checkpoint(engine)?;
-        let pointer = match self.last_manifest_commit(engine) {
-            Ok(pointer) => pointer,
-            // A snapshot on its standalone checkpoint, with that commit and no CRC, has no pointer
-            // to check. The file alone holds the action.
-            Err(KernelError::MissingVersion(_)) if standalone.is_some() => None,
-            Err(err) => return Err(err),
-        };
-        let Some(file) = standalone else {
-            return Ok(
-                pointer.map(|pointer| CheckpointActionSource::ManifestCommit {
-                    pointer,
-                    superseded_standalone: None,
-                }),
-            );
-        };
-        let file_version = version_as_i64(file.version)?;
-        match pointer {
-            Some(pointer) if pointer.version > file_version => {
-                Ok(Some(CheckpointActionSource::ManifestCommit {
-                    pointer,
-                    superseded_standalone: Some(file_version),
-                }))
-            }
-            pointer => Ok(Some(CheckpointActionSource::Standalone { file, pointer })),
-        }
-    }
-
     /// Get the timestamp for this snapshot's version, in milliseconds since the Unix epoch.
     ///
     /// When In-Commit Timestamp (ICT) are enabled, returns the In-Commit Timestamp value.
@@ -1836,7 +1776,16 @@ impl Snapshot {
         // The standalone file holds the action inline, so the new snapshot need not read it back.
         #[cfg(feature = "adaptive-metadata-in-dev")]
         if let Some(action) = standalone_action {
-            let _ = new_snapshot.checkpoint_action.set(Some(Arc::new(action)));
+            let source = new_snapshot
+                .log_segment
+                .checkpoint_action_source(engine, || new_snapshot.last_manifest_commit(engine))?;
+            let resolved = source.map(|source| {
+                Arc::new(ResolvedCheckpointAction {
+                    action: Arc::new(action),
+                    source,
+                })
+            });
+            let _ = new_snapshot.checkpoint_action.set(resolved);
         }
         Ok((CheckpointWriteResult::Written, Arc::new(new_snapshot)))
     }

@@ -225,18 +225,19 @@ fn listed_predecessor(
     snapshot: &SnapshotRef,
     engine: &dyn Engine,
 ) -> KernelResult<Option<ParsedLogPath<FileMeta>>> {
-    let Some((base, source)) = snapshot.latest_checkpoint_action_with_source(engine)? else {
+    let Some(resolved) = snapshot.resolved_checkpoint_action(engine)? else {
         return Ok(None);
     };
+    let base = &resolved.action;
     let Some(listed_version) = snapshot.log_segment().checkpoint_version else {
         return Ok(None);
     };
     if version_as_i64(listed_version)? < base.version() {
         return Ok(None);
     }
-    match source {
+    match &resolved.source {
         CheckpointActionSource::Standalone { file, .. } if file.version == listed_version => {
-            Ok(Some(file))
+            Ok(Some(file.clone()))
         }
         _ => Err(KernelError::unsupported(format!(
             "cannot write a standalone checkpoint: the listed checkpoint at version \

@@ -1423,16 +1423,14 @@ impl Scan {
         let (checkpoint_schema, meta_predicate, physical_stats_read_schema) =
             self.checkpoint_read_options();
         #[cfg(feature = "adaptive-metadata-in-dev")]
-        if let Some((checkpoint, source)) =
-            self.snapshot.latest_checkpoint_action_with_source(engine)?
-        {
+        if let Some(resolved) = self.snapshot.resolved_checkpoint_action(engine)? {
             return self
                 .snapshot
                 .log_segment()
                 .read_actions_with_checkpoint_action(
                     engine,
-                    &checkpoint,
-                    &source,
+                    &resolved.action,
+                    &resolved.source,
                     self.snapshot.table_root(),
                     COMMIT_READ_SCHEMA.clone(),
                     checkpoint_schema,

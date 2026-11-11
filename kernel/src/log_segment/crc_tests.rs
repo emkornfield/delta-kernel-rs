@@ -15,13 +15,15 @@ use url::Url;
 
 use super::LogSegment;
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::actions::{CheckpointAction, LastManifestCommit};
+use crate::actions::LastManifestCommit;
 use crate::actions::{DomainMetadata, Format, Metadata, Protocol, SetTransaction};
 use crate::crc::{
     Crc, DomainMetadataState, FileSizeHistogram, SetTransactionState, try_read_crc_file,
 };
 use crate::engine::CancellableEngine;
 use crate::engine::sync::SyncEngine;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::log_segment::ResolvedCheckpointAction;
 use crate::object_store::ObjectStoreExt as _;
 use crate::object_store::memory::InMemory;
 use crate::path::ParsedLogPath;
@@ -601,7 +603,7 @@ impl BuiltCrcTest {
     /// Lists the log, reads the latest on-disk CRC, and runs the unchecked P&M replay, returning
     /// the latest AMT `checkpoint` action it captured, if any.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    fn captured_checkpoint_action(&self) -> Option<Arc<CheckpointAction>> {
+    fn captured_checkpoint_action(&self) -> Option<Arc<ResolvedCheckpointAction>> {
         let storage = self.engine.storage_handler();
         let log_root = self.url.join("_delta_log/").unwrap();
         let log_segment =
@@ -899,7 +901,7 @@ async fn test_crc_seeded_replay_follows_pointer_to_checkpoint_action(
     test.assert_p_m(None, config.protocol(), config.metadata());
     let captured = test
         .captured_checkpoint_action()
-        .map(|action| action.version);
+        .map(|resolved| resolved.action.version);
     let replay_reads_pointed_action = pointed_version == 1;
     assert_eq!(
         captured,

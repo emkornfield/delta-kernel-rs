@@ -13,8 +13,8 @@ use url::Url;
 use super::LogSegment;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use super::{
-    last_manifest_commit_inconsistency, missing_pointed_checkpoint_action,
-    require_pointed_checkpoint_action,
+    ResolvedCheckpointAction, last_manifest_commit_inconsistency,
+    missing_pointed_checkpoint_action, require_pointed_checkpoint_action,
 };
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::Version;
@@ -650,7 +650,7 @@ pub(crate) struct PmResolution {
     /// The AMT `checkpoint` action that `lastManifestCommit` names, if replay read it. This only
     /// saves a read: when it is `None`, the snapshot follows `lastManifestCommit` to the action.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    pub(crate) captured_checkpoint_action: Option<Arc<CheckpointAction>>,
+    pub(crate) captured_checkpoint_action: Option<Arc<ResolvedCheckpointAction>>,
     /// How the segment's `lastManifestCommit` was resolved. See [`LastManifestCommitResolution`].
     #[cfg(feature = "adaptive-metadata-in-dev")]
     pub(crate) last_manifest_commit: LastManifestCommitResolution,
@@ -709,7 +709,11 @@ impl PmCandidate {
             protocol: self.protocol.map(|(_, p)| p),
             source,
             #[cfg(feature = "adaptive-metadata-in-dev")]
-            captured_checkpoint_action: self.checkpoint.map(|(_, c)| Arc::new(c)),
+            captured_checkpoint_action: self.checkpoint.map(|(version, action)| {
+                Arc::new(ResolvedCheckpointAction::from_manifest_commit(
+                    version, action,
+                ))
+            }),
             #[cfg(feature = "adaptive-metadata-in-dev")]
             last_manifest_commit: LastManifestCommitResolution::from_replay(
                 self.last_manifest_commit,

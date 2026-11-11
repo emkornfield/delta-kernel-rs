@@ -439,7 +439,7 @@ async fn assert_replay_resolution<E: Engine>(
     let version = replay_pm(commits, make_engine)
         .await
         .captured_checkpoint_action
-        .map(|action| action.version);
+        .map(|resolved| resolved.action.version);
     assert_eq!(version, expected_version);
 }
 
@@ -545,7 +545,7 @@ fn assert_resolved_pointer(
 ) {
     let captured = resolution
         .captured_checkpoint_action
-        .map(|action| action.version);
+        .map(|resolved| resolved.action.version);
     assert_eq!(captured, captured_version);
     assert_eq!(&resolution.last_manifest_commit, expected);
 }
@@ -572,7 +572,7 @@ async fn non_plan_replay_reads_each_commit_once_in_one_call(#[case] later_commit
     assert_eq!(
         resolution
             .captured_checkpoint_action
-            .map(|action| action.version),
+            .map(|resolved| resolved.action.version),
         Some(0)
     );
     let pointed_commit = table_root
@@ -1543,7 +1543,7 @@ async fn assert_compacted_replay<E: Engine>(
     // These fixtures' checkpoint actions are at their content root version.
     let captured_version = resolution
         .captured_checkpoint_action
-        .map(|action| action.version);
+        .map(|resolved| resolved.action.version);
     let expected_version = match expected {
         LastManifestCommitResolution::Resolved(Some(pointer)) => Some(pointer.content_root_version),
         _ => None,
