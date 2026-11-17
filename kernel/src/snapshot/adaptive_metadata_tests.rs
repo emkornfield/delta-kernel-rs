@@ -109,7 +109,7 @@ fn newer_catalog_bound_preserves_populated_adaptive_metadata_caches(
         "",
         crc_version,
     );
-    let checkpoint = source.latest_checkpoint_action(&engine).unwrap().unwrap();
+    let checkpoint = source.resolved_checkpoint_action(&engine).unwrap().unwrap();
     let manifest = source.last_manifest_commit(&engine).unwrap().unwrap();
     let engine = MeteredDeltaEngine::new(Arc::new(engine));
     let (reporter, _guard) = measuring_reporter();

@@ -116,9 +116,9 @@ mod tests {
     use crate::object_store::memory::InMemory;
     use crate::snapshot::{CheckpointWriteResult, Snapshot};
     use crate::unit_test_utils::adaptive_metadata_fixtures::{
-        last_manifest_commit_info, minimal_checkpoint_action, setup_adaptive_metadata_table,
-        setup_table, setup_table_on, standalone_checkpoint_rows, write_commit,
-        write_commit_after_manifest_commit, write_manifest_commit, write_sidecar,
+        commit_info_line, last_manifest_commit_info, minimal_checkpoint_action,
+        setup_adaptive_metadata_table, setup_table, setup_table_on, standalone_checkpoint_rows,
+        write_commit, write_commit_after_manifest_commit, write_manifest_commit, write_sidecar,
         write_standalone_checkpoint_batches,
     };
     use crate::unit_test_utils::{assert_result_error_with_message, parse_json_batch};
@@ -344,6 +344,32 @@ mod tests {
         let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
         assert_eq!(snapshot.version(), 2);
         assert_eq!(snapshot.latest_checkpoint_action(&engine)?, Some(written));
+        Ok(())
+    }
+
+    #[test]
+    fn latest_checkpoint_action_rejects_standalone_checkpoint_without_manifest_commit() -> Result<()>
+    {
+        let (engine, table_root) = setup_table()?;
+        write_commit(
+            &engine,
+            &table_root,
+            1,
+            parse_json_batch(StringArray::from(vec![commit_info_line(1, None)])),
+        )?;
+        write_standalone_checkpoint_batches(
+            &engine,
+            &table_root,
+            1,
+            vec![standalone_checkpoint_rows(1, 1)],
+        )?;
+
+        let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+        assert_result_error_with_message(
+            snapshot.latest_checkpoint_action(&engine),
+            "standalone checkpoint at version 1 references a content tree, but lastManifestCommit \
+             says no manifest commit exists",
+        );
         Ok(())
     }
 

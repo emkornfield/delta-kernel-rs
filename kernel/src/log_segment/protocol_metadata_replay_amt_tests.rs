@@ -243,7 +243,7 @@ impl ReplayExpectation {
             let version = resolution
                 .captured_checkpoint_action
                 .as_ref()
-                .map(|action| action.version);
+                .map(|resolved| resolved.action.version);
             assert_eq!(version, captured);
         }
         if let Some(last_manifest_commit) = &self.last_manifest_commit {
