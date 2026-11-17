@@ -36,7 +36,7 @@ use crate::schema::SchemaRef;
 use crate::table_features::TableFeature;
 use crate::transaction::UpdateTableOperation;
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
-    checkpoint_line, commit_info_line, last_manifest_commit_info, pointer,
+    checkpoint_line, commit_info_line, last_manifest_commit_info, non_plan_engine, pointer,
     protocol_and_metadata_lines, standalone_checkpoint_rows, txn_line,
 };
 use crate::unit_test_utils::{
@@ -283,15 +283,6 @@ async fn assert_replay<E: Engine>(
     make_engine: impl FnOnce(Arc<InMemory>) -> E,
 ) {
     expected.check(replay(log, crc, make_engine).await.unwrap());
-}
-
-// Removes SyncEngine's plan executor so replay uses the non-plan path even when
-// `declarative-plans` is compiled in. Otherwise SyncEngine would use the plan path.
-fn non_plan_engine(store: Arc<InMemory>) -> impl Engine {
-    let engine = SyncEngine::new_with_store(store);
-    #[cfg(feature = "declarative-plans")]
-    let engine = DelegatingEngine::new(Arc::new(engine)).without_plan_executor();
-    engine
 }
 
 // SyncEngine with its plan executor, so replay takes the plan path.
