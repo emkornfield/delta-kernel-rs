@@ -51,12 +51,12 @@ impl ManifestCommitState {
         if let Some(checkpoint) = read_snapshot.latest_checkpoint_action(engine)? {
             let snapshot_version = version_as_i64(read_snapshot.version())?;
             require!(
-                checkpoint.version() >= snapshot_version,
+                checkpoint.content_root_version() >= snapshot_version,
                 KernelError::unsupported(format!(
                     "manifest commit does not currently support delta log commits after the last \
-                     manifest commit; the latest checkpoint covers version {} but the snapshot is \
-                     at {snapshot_version}",
-                    checkpoint.version()
+                     manifest commit; the latest checkpoint's content root covers version {} but \
+                     the snapshot is at {snapshot_version}",
+                    checkpoint.content_root_version()
                 ))
             );
         }

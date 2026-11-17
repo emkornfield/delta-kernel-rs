@@ -838,6 +838,8 @@ mod tests {
             snapshot,
             schema_context,
             read_schema,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            standalone_action: None,
         })
     }
 
