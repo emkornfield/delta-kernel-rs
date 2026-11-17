@@ -114,7 +114,7 @@ use crate::action_reconciliation::file_metadata::{
     StatsTransformConfig, build_checkpoint_read_schema, build_checkpoint_transform,
 };
 use crate::action_reconciliation::log_replay::{
-    ActionReconciliationBatch, ActionReconciliationProcessor,
+    ActionReconciliationBatch, ActionReconciliationProcessor, RemoveRetention,
 };
 use crate::action_reconciliation::{
     ActionReconciliationIterator, ActionReconciliationIteratorState, RetentionCalculator,
@@ -482,7 +482,7 @@ impl CheckpointWriter {
 
         // Process actions through reconciliation
         let mut processor = ActionReconciliationProcessor::new(
-            self.deleted_file_retention_timestamp()?,
+            RemoveRetention::ExpireAtOrBefore(self.deleted_file_retention_timestamp()?),
             self.get_transaction_expiration_timestamp()?,
             self.snapshot.table_configuration().dv_normalization_root(),
         );
