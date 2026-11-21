@@ -567,10 +567,10 @@ mod tests {
 
         let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
         let exec = SyncPlanExecutor::new(Some(store));
-        let shape = CheckpointShape::resolve(&exec, snapshot.log_segment())
+        let info = CheckpointInfo::resolve(&exec, snapshot.log_segment())
             .unwrap()
             .unwrap();
-        assert!(shape.sidecars.is_empty());
+        assert!(info.sidecars.is_empty());
     }
 
     /// Requested stats schema for the `*-struct-stats-only` fixtures (`id: long`, `value: string`),
